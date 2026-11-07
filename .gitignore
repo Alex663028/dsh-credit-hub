@@ -1,0 +1,11 @@
+# 运行态数据绝不入库（真实凭据只存在于 {DSH_HOME}/credit-hub/）
+# —— 全部锚定仓库根目录，避免误伤 vendor/channel-pack/
+/accounts.json
+/settings.json
+/routes.json
+/gateway/
+/channel-pack/
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
