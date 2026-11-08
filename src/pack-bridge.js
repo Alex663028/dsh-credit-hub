@@ -190,8 +190,10 @@ export function createPackBridge({ logger, warn } = {}) {
       ...(Number.isFinite(options?.maxTokens) ? { maxTokens: options.maxTokens } : {}),
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
       ...reasoningPatch,
-      // 会话透传：渠道包适配器按 sessionId 做配额/会话记账，缺了会退化成共享会话
-      sessionId: typeof options?.sessionId === 'string' ? options.sessionId : '',
+      // 会话透传：渠道包适配器按 sessionId 做配额/会话记账。⚠️ 空 sessionId
+      // 必须整个缺席（宿主会话机制拿空串查记录 → 读 replayState 崩），
+      // 缺席时适配器走自己的默认会话。
+      ...(typeof options?.sessionId === 'string' && options.sessionId !== '' ? { sessionId: options.sessionId } : {}),
       signal,
     }
     let outcome = { sawFinish: false, finish: undefined, usage: undefined }
