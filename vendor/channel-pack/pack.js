@@ -33198,6 +33198,11 @@ var QODER_FALLBACK_MODELS = [
   { id: "dmodel", name: "DeepSeek-V4-Pro", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ["high", "max"], defaultEffort: "max", supportsDisable: true },
   { id: "dfmodel", name: "DeepSeek-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "max", supportsDisable: true },
   { id: "mmodel", name: "MiniMax-M3", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.2 }
+,
+  // ⚠️ 新模型占位（dsh-credit-hub 2026-11-08）：上游已上线 Qoduck，官方 catalog
+  // 的档位/倍率/窗口**未实测**——以下为占位值（对齐 1M 档惯例），接入后按
+  // catalog 复核；若上游真实 id 与此不同（报 model not found），改本行 id 即可。
+  { id: "qoduck", name: "Qoduck", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 1, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "high", supportsDisable: true }
 ];
 var QODER = {
   id: "qoder",

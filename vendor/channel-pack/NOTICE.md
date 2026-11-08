@@ -30,6 +30,9 @@
 - `pack.js` 中 Gemini 渠道的 `GEMINI_DEFAULT_CLIENT_ID/SECRET` 常量以**字符串拼接**形式书写
   （运行值不变）：这是 Google 开源 gemini-cli 的公开 installed-app 客户端凭据（与官方仓库数值
   一致，非机密），分段只为规避 GitHub push protection 对 OAuth 凭据形状的误报。
+- `pack.js` 的 `QODER_FALLBACK_MODELS` 追加了 **Qoduck** 条目（上游新模型，静态表未收录）：
+  上下文/档位/倍率为占位值，待按官方 catalog 复核；若上游真实 id 与 `qoduck` 不同，
+  改该条目的 `id` 即可。
 
 ## 再构建
 
