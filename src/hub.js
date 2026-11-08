@@ -378,6 +378,10 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       }
       const failure = streamError ?? outcome?.__error
       if (failure !== undefined || outcome === undefined) {
+        // 崩溃堆栈落日志（warn → logs.jsonl）：只有 message 的错误无法定位
+        if (failure?.stack) {
+          warn?.(`turn ${entry?.id ?? options.model} 崩溃堆栈: ${String(failure.stack).split('\n').slice(0, 10).join(' ⏎ ')}`)
+        }
         const aborted = options.signal?.aborted === true || failure?.code === CODE.aborted
         // 排空 channel 里剩余的块收尾帧（flushTails 在错误前推入的 block-end），
         // 有 2s 上界——渠道实现若没关闭也不无限等。

@@ -96,11 +96,22 @@ export function startGateway({ stores, hub, logger, settings, log }) {
   }
 
   const authorized = req => {
-    const header = String(req.headers.authorization ?? '')
-    const presented = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
-    if (presented && keyMatches(presented, apiKey)) return true
-    // codex 系代理可能把 Key 放在 x-api-key 而非 Authorization
-    return keyMatches(String(req.headers['x-api-key'] ?? ''), apiKey)
+    // codex 系代理送 Key 的姿势五花八门：Authorization: Bearer、x-api-key、
+    // api-key、双 Bearer 前缀、?key= 查询参数——全部兼容，值匹配即放行
+    const candidates = []
+    const authHeader = String(req.headers.authorization ?? '').trim()
+    candidates.push(authHeader)
+    if (authHeader.toLowerCase().startsWith('bearer ')) candidates.push(authHeader.slice(7).trim())
+    candidates.push(String(req.headers['x-api-key'] ?? '').trim())
+    candidates.push(String(req.headers['api-key'] ?? '').trim())
+    try {
+      candidates.push(new URL(req.url ?? '/', 'http://localhost').searchParams.get('key') ?? '')
+    } catch {}
+    for (const candidate of candidates) {
+      const value = candidate.replace(/^bearer\s+/i, '').trim()
+      if (value && keyMatches(value, apiKey)) return true
+    }
+    return false
   }
 
   // ── harness options ← external wire bodies ────────────────────────────────
@@ -660,14 +671,14 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         if (!keyOk) {
           // 401 也留痕：调用方 Key 配错是最高频的接入问题
           log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配，key 头前 6 位: ${String(req.headers.authorization ?? req.headers['x-api-key'] ?? '').slice(0, 12)}）` })
-          return send(res, 401, { error: { message: 'invalid gateway key', type: 'auth_error' } })
+          return send(res, 401, { error: { message: 'invalid gateway key — 请把网关页显示的完整 Key 粘贴到 EKKO 渠道配置的 API Key 字段（也可在 base_url 后加 ?key=<网关Key>）', type: 'auth_error' } })
         }
         if (req.method === 'POST' && routePath.startsWith('/v1/')) {
           // 请求体预览落日志：调用方接入排查的第一现场
           rawBody = await readBody(req)
           let modelPreview = ''
           try { modelPreview = String(JSON.parse(rawBody || '{}')?.model ?? '') } catch {}
-          log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} body=${rawBody.slice(0, 300)}` })
+          log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} body=${rawBody.slice(0, 1500)}` })
         }
         if (req.method === 'GET' && routePath === '/v1/models') {
           const rows = await hub.catalog()
