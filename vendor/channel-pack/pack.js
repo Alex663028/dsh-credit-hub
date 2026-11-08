@@ -33195,6 +33195,10 @@ var QODER_FALLBACK_MODELS = [
   { id: "kmodel", name: "Kimi-K2.8-Preview", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "max" },
   { id: "gmodel", name: "GLM-5.3", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.8, efforts: ["high", "low", "max"], defaultEffort: "max" },
   { id: "gfmodel", name: "GLM-5.3-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max"], defaultEffort: "max" },
+
+  // ⚠️ Qoduck（上游新模型，dsh-credit-hub 占位 2026-11-08）：id/档位/窗口未实测
+  // ——若 112 model_error 则 id 不对，需从 Qoder 客户端网络面板抓真实 id
+  { id: "qoduck", name: "Qoduck", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "high", supportsDisable: true },
   { id: "dmodel", name: "DeepSeek-V4-Pro", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ["high", "max"], defaultEffort: "max", supportsDisable: true },
   { id: "dfmodel", name: "DeepSeek-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "max", supportsDisable: true },
   { id: "mmodel", name: "MiniMax-M3", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.2 }
