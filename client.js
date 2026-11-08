@@ -106,6 +106,8 @@ window.__ModuleLoader__?.load({
     'chan.pack.dual': '⚠ 检测到 Our Free Model 也在运行同源渠道包：双份挂载会导致 DSH 崩溃，请立即停用其中一方。',
     'chan.pack.none': '未挂载（把总览页「渠道包模式」切到「独立反代」）',
     'chan.pack.offLine': '渠道包未挂载',
+    'bridge.title': '桥接渠道（宿主注册 provider）',
+    'bridge.hint': '经 pk/ 桥接接入的宿主渠道模型——可逐个开关',
     'chan.pack.diag': '诊断',
     'chan.rpc.unavailable': '渠道服务不可用（需要 DSH 桌面端环境）',
     'chan.openLogin': '打开授权页',
@@ -243,6 +245,8 @@ window.__ModuleLoader__?.load({
     'chan.pack.dual': '⚠ Our Free Model is also running its channel pack. This plugin registers first; consider disabling Our Free Model in DSH plugin manager to avoid duplicate channels & check-ins.',
     'chan.pack.none': 'Not mounted (set accountPack to on)',
     'chan.pack.offLine': 'Channel pack not mounted',
+    'bridge.title': 'Bridged channels (host-registered providers)',
+    'bridge.hint': 'Host provider models bridged via pk/ — toggle individually',
     'chan.pack.diag': 'Diagnose',
     'chan.checkNow': 'Check now',
     'chan.modelsToggle': 'Models',
@@ -851,7 +855,11 @@ window.__ModuleLoader__?.load({
     function ChannelsPage({ ctx }) {
       const { available, rpc } = useChannelRpc(ctx)
       const [summary, setSummary] = useState(null)
-      useEffect(() => { void api('/summary').then(setSummary).catch(() => {}) }, [])
+      const [hubModels, setHubModels] = useState([])
+      useEffect(() => {
+        void api('/summary').then(setSummary).catch(() => {})
+        void api('/models').then(payload => setHubModels(payload.models ?? [])).catch(() => {})
+      }, [])
       const packReason = summary?.pack?.status?.reason
       const mounted = packReason === 'forced' || packReason === 'auto' || summary?.pack?.status?.mounted === true
       const packNote = mounted ? t('chan.pack.byMe')
@@ -876,7 +884,35 @@ window.__ModuleLoader__?.load({
         h(WorkBuddyCard),
         h('div', { className: 'ch-cards-grid' }, CHANNEL_PROVIDERS.map((channel, index) => h(PackChannelCard, {
           key: channel.id, channel: { ...channel, offset: (index % 5) * 3000 }, rpc: available ? rpc : null, packNote,
-        }))))
+        }))),
+        h(BridgeModelsCard, { hubModels }))
+    }
+
+    // ── 桥接渠道模型开关（宿主注册 provider：deepseek-account/tokenrhythm/…） ──
+    function BridgeModelsCard({ hubModels }) {
+      const [toast, showToast] = useToast()
+      const grouped = {}
+      for (const model of (hubModels ?? []).filter(row => row.id.startsWith('pk/'))) {
+        ;(grouped[model.provider] ??= []).push(model)
+      }
+      const providers = Object.keys(grouped).sort()
+      if (providers.length === 0) return null
+      const toggle = async model => {
+        try {
+          await api('/models/toggle', { id: model.id, disabled: model.disabled !== true })
+          showToast(model.disabled !== true ? `${model.id} 已隐藏` : `${model.id} 已恢复`)
+        } catch (error) { showToast(String(error.message), 'warn') }
+      }
+      return h(Card, { title: t('bridge.title'), accent: '#7a6cf0', badge: h('span', { className: 'ch-org' }, t('bridge.hint')) },
+        h('div', { className: 'ch-rows' }, providers.map(provider => h('div', { className: 'ch-uppanel', key: provider },
+          h('div', { className: 'ch-row', style: { marginBottom: '8px' } }, h('b', null, provider)),
+          h('div', { className: 'ch-rows' }, grouped[provider].models.map(model => h('div', { className: 'ch-rowline', key: model.id },
+            h('div', { className: 'ch-rowline-main' },
+              h('code', null, model.modelId ?? model.id),
+              model.disabled === true ? h(StateBadge, { text: t('chan.model.hidden') }) : null),
+            h('div', { className: 'ch-rowline-actions' },
+              h(Btn, { small: true, kind: model.disabled === true ? 'primary' : undefined, onClick: () => toggle(model) },
+                model.disabled === true ? t('chan.model.on') : t('chan.model.off'))))))))))
     }
 
     // ── API 中转 ───────────────────────────────────────────────────────────────
