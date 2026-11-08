@@ -22,6 +22,8 @@
  * @module src/pack-bridge.js
  */
 
+import crypto from 'node:crypto'
+
 const EXCLUDED_PROVIDERS = new Set([
   'credit-hub',
   'anthropic',
@@ -40,6 +42,16 @@ export function parsePackModelId(id) {
   const slashAt = id.indexOf('/', 3)
   if (slashAt <= 3 || slashAt === id.length - 1) return null
   return { provider: id.slice(3, slashAt), model: id.slice(slashAt + 1) }
+}
+
+/** 宿主 dsh-llm 的懒加载（createToolResultMessage / ReasoningEffortId）：
+ *  与 pack.js 同一解析链，宿主进程内可达；不可达时退回字面量兜底。 */
+let dshLlmModule = null
+async function dshLlmHelpers() {
+  if (dshLlmModule === null) {
+    try { dshLlmModule = await import('@deepseek-ai/dsh-llm') } catch { dshLlmModule = false }
+  }
+  return dshLlmModule === false ? null : dshLlmModule
 }
 
 export function createPackBridge({ logger, warn } = {}) {
@@ -159,41 +171,91 @@ export function createPackBridge({ logger, warn } = {}) {
     // 思考强度钳制：调用方的 effort 必须落在该模型受支持的档位集合内——
     // 模型不支持思考（无菜单）时整个去掉，否则 Raccoon 等适配器直接报
     // "does not support reasoning effort"
-    let reasoningPatch = {}
+    let clampedEffort
     if (options?.reasoningEffort !== undefined) {
       const meta = await resolveMeta(route.provider, route.model)
-      const effort = clampEffort(String(options.reasoningEffort), meta)
-      if (effort !== undefined) reasoningPatch = { reasoningEffort: effort }
+      clampedEffort = clampEffort(String(options.reasoningEffort), meta)
     }
+    // 消息构造完全对齐 pack 自家网关的 toGenerateOptions/convertMessage：
+    // ① content 一律块数组（宿主消息约定，字符串内容会打崩部分适配器）
+    // ② 每条消息带 id + source 元数据（宿主会话记录按消息 id 建档）
+    // ③ 工具结果经宿主 createToolResultMessage 工厂构造（形状由宿主管）
+    // ④ generate 里没有独立的 system 字段——system 就是 messages 里的一条
+    const dshLlm = await dshLlmHelpers()
+    const uuid8 = () => crypto.randomBytes(8).toString('hex')
+    const gwMessage = (role, content, extra = {}) => ({ id: uuid8(), role, content, ...extra })
+    const gwMessages = []
+    for (const message of messages) {
+      const blocks = typeof message?.content === 'string' ? [{ type: 'text', text: message.content }] : Array.isArray(message?.content) ? message.content : []
+      if (message?.role === 'system' || message?.role === 'developer') {
+        const text = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n')
+        if (text) gwMessages.push(gwMessage('system', [{ type: 'text', text }], { source: { kind: 'plugin:credit-hub' } }))
+        continue
+      }
+      if (message?.role === 'tool') {
+        if (dshLlm?.createToolResultMessage) {
+          for (const result of blocks.filter(block => block.type === 'tool-result')) {
+            const inner = (Array.isArray(result.content) ? result.content : []).filter(part => part.type === 'text').map(part => ({ type: 'text', text: part.text }))
+            gwMessages.push(dshLlm.createToolResultMessage({ callId: String(result.toolCallId ?? ''), content: inner, isError: false }))
+          }
+        } else {
+          // dsh-llm 不可达时的兜底形状（与宿主工具消息同构的字面量）
+          for (const result of blocks.filter(block => block.type === 'tool-result')) {
+            const inner = (Array.isArray(result.content) ? result.content : []).filter(part => part.type === 'text').map(part => ({ type: 'text', text: String(part.text ?? '') }))
+            gwMessages.push({ id: uuid8(), role: 'tool', callId: String(result.toolCallId ?? ''), content: inner, isError: false })
+          }
+        }
+        continue
+      }
+      if (message?.role === 'assistant') {
+        const content = []
+        if (typeof message.reasoning_content === 'string' && message.reasoning_content) content.push({ type: 'reasoning', text: message.reasoning_content })
+        for (const block of blocks) {
+          if (block.type === 'text' && block.text) content.push({ type: 'text', text: block.text })
+          else if (block.type === 'reasoning' && block.text) content.push({ type: 'reasoning', text: block.text })
+          else if (block.type === 'tool-call') content.push({ type: 'tool-call', id: String(block.id ?? ''), name: String(block.name ?? ''), arguments: typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments ?? {}) })
+        }
+        if (content.length > 0) gwMessages.push(gwMessage('assistant', content, { source: { kind: 'model', provider: route.provider, model: route.model } }))
+        continue
+      }
+      const content = []
+      for (const block of blocks) {
+        if (block.type === 'text' && block.text) content.push({ type: 'text', text: block.text })
+        else if (block.type === 'image' && typeof block.image === 'string') content.push({ type: 'image_url', image_url: { url: block.image } })
+      }
+      if (content.length > 0) gwMessages.push(gwMessage('user', content, { source: { kind: 'user' } }))
+    }
+    // 思考强度规范化：钳制到模型菜单后，还要过宿主 ReasoningEffortId
+    // （与 pack 自家网关同款——原始字符串不保证是合法枚举值）
+    let reasoningPatch = {}
+    if (clampedEffort !== undefined) {
+      try {
+        if (dshLlm?.ReasoningEffortId) reasoningPatch = { reasoningEffort: dshLlm.ReasoningEffortId(clampedEffort) }
+        else reasoningPatch = { reasoningEffort: clampedEffort }
+      } catch { reasoningPatch = {} }
+    }
+    const tools = (Array.isArray(options?.tools) ? options.tools : []).map(tool => {
+      const source = tool && typeof tool.function === 'object' && tool.function !== null ? tool.function : tool
+      const name = String(source?.name ?? '').trim()
+      if (!name) return null
+      return {
+        name,
+        description: typeof source?.description === 'string' ? source.description : '',
+        parameters: source?.parameters && typeof source.parameters === 'object' && !Array.isArray(source.parameters)
+          ? source.parameters
+          : { type: 'object', properties: {} },
+      }
+    }).filter(Boolean)
     const generate = {
       provider: route.provider,
       model: route.model,
-      messages: chat,
-      // 适配器可能无条件读取这些字段的 .length（Raccoon 对每个工具读
-      // tool.description.length 等）——缺省字段一律补齐宿主 GenerateOptions
-      // 的默认形状，且工具统一归一化为扁平定义（调用方可能是 OpenAI 包裹
-      // 格式，description 在 tool.function 里，顶层 undefined 必崩）
-      system: systemText,
-      tools: (Array.isArray(options?.tools) ? options.tools : []).map(tool => {
-        const source = tool && typeof tool.function === 'object' && tool.function !== null ? tool.function : tool
-        const name = String(source?.name ?? '').trim()
-        if (!name) return null
-        return {
-          name,
-          description: typeof source?.description === 'string' ? source.description : '',
-          parameters: source?.parameters && typeof source.parameters === 'object' && !Array.isArray(source.parameters)
-            ? source.parameters
-            : { type: 'object', properties: {} },
-        }
-      }).filter(Boolean),
-      stop: Array.isArray(options?.stop) ? options.stop : [],
+      messages: gwMessages,
+      // 与 pack 自家网关同构：tools/stop 空时整个省略（undefined），不传空数组
+      ...(tools.length > 0 ? { tools } : {}),
       ...(Number.isFinite(options?.maxTokens) ? { maxTokens: options.maxTokens } : {}),
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
+      ...(Array.isArray(options?.stop) && options.stop.length > 0 ? { stop: options.stop } : {}),
       ...reasoningPatch,
-      // 会话透传：渠道包适配器按 sessionId 做配额/会话记账。⚠️ 空 sessionId
-      // 必须整个缺席（宿主会话机制拿空串查记录 → 读 replayState 崩），
-      // 缺席时适配器走自己的默认会话。
-      ...(typeof options?.sessionId === 'string' && options.sessionId !== '' ? { sessionId: options.sessionId } : {}),
       signal,
     }
     let outcome = { sawFinish: false, finish: undefined, usage: undefined }

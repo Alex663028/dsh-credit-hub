@@ -312,8 +312,12 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
   assert.equal(outcome.usage.outputTokens, 4)
   assert.equal(seen[0].provider, 'qoder')
   assert.equal(seen[0].model, 'glm-5')
-  assert.equal(seen[0].system, 'sys', 'system hoisted out of messages')
-  assert.equal(seen[0].messages.length, 1, 'system removed from chat messages')
+  // 宿主消息形状：content 块数组 + system 就是 messages 里的一条
+  assert.equal(seen[0].messages[0].role, 'system')
+  assert.equal(seen[0].messages[0].content[0].text, 'sys')
+  assert.equal(seen[0].messages[1].role, 'user')
+  assert.equal(seen[0].messages[1].content[0].text, 'hi')
+  assert.equal(typeof seen[0].messages[0].id, 'string', '每条消息带 id（宿主会话建档用）')
   assert.equal(seen[0].maxTokens, 777)
 
   // 工具归一化：OpenAI 包裹格式（description 在 function 里）→ 扁平定义，
