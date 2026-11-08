@@ -421,16 +421,22 @@ await testAsync('gateway e2e: openai/anthropic/combo/failover/usage-protocol/cus
 
   // Responses 线（/v1/responses，Codex wire——EKKO 等经 codex-proxy 的 agent）：
   // 非流式（含 function_call 输出）+ 流式事件序列 + x-api-key 鉴权
-  // 注：先把上游 fake 恢复健康（上一段测试把它换成了抛异常版本）
-  upstreams.streamTurn = async ({ onChunk }) => {
+  // 注：先把上游 fake 恢复健康（上一段测试把它换成了抛异常版本），
+  // 且带 tools 时返回工具调用（模拟真实模型行为）
+  upstreams.streamTurn = async ({ onChunk, options }) => {
     onChunk({ type: 'block-start', index: 0, blockType: 'text' })
+    if (Array.isArray(options?.tools) && options.tools.length > 0) {
+      const name = options.tools[0]?.function?.name ?? options.tools[0]?.name ?? 'read_file'
+      onChunk({ type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_test_1', name, arguments: '{"path":"/tmp/a.txt"}' } })
+      return { sawToolCall: true, sawFinish: true, finish: 'tool_calls', usage: { inputTokens: 5, outputTokens: 2 }, nextIndex: 1 }
+    }
     onChunk({ type: 'text-delta', index: 0, text: 'up-answer' })
     onChunk({ type: 'block-end', index: 0, block: { type: 'text', text: 'up-answer' } })
     return { sawText: true, sawFinish: true, finish: 'stop', usage: { inputTokens: 5, outputTokens: 2 }, nextIndex: 1 }
   }
   const resp = await (await fetch(`${base}/v1/responses`, {
     method: 'POST', headers: auth, body: JSON.stringify({
-      model: 'wb/m1', input: 'read /tmp/a.txt', max_output_tokens: 500,
+      model: 'up/m1', input: 'read /tmp/a.txt', max_output_tokens: 500,
       tools: [{ type: 'function', name: 'read_file', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
     }),
   })).json()
