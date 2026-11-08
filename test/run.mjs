@@ -19,6 +19,7 @@ import { createHubRuntime } from '../src/hub.js'
 import { createUpstreamRuntime } from '../src/aggregate.js'
 import { createWorkbuddyRuntime } from '../src/workbuddy.js'
 import { startGateway } from '../src/forward.js'
+import { createPackBridge, parsePackModelId } from '../src/pack-bridge.js'
 import { postSse } from '../src/http.js'
 import { createRing } from '../src/util.js'
 
@@ -254,6 +255,85 @@ await testAsync('combo silence watchdog advances past a hung candidate', async (
   assert(Date.now() - started < 10_000, `advanced in ${Date.now() - started}ms`)
   assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'up-aup-b')
   assert(chunks.some(c => c.type === 'finish' && c.reason.kind === 'stop'))
+  stores.dispose()
+  await rmDir(dir)
+})
+
+// ── pack 桥接：id 解析 / 目录并入 / llm.stream 转发 ─────────────────────────
+test('parsePackModelId shapes', () => {
+  assert.deepEqual(parsePackModelId('pk/qoder/glm-5'), { provider: 'qoder', model: 'glm-5' })
+  assert.deepEqual(parsePackModelId('pk/raccoon/a/b'), { provider: 'raccoon', model: 'a/b' })
+  assert.equal(parsePackModelId('wb/cn/x'), null)
+  assert.equal(parsePackModelId('pk/'), null)
+  assert.equal(parsePackModelId('pk/p/'), null)
+  assert.equal(parsePackModelId(undefined), null)
+})
+
+await testAsync('pack bridge lists host providers and forwards llm.stream', async () => {
+  const dir = tmpDir('ch-pk-')
+  const stores = createStores(dir)
+  const seen = []
+  const fakeLlm = {
+    listProviders: async () => [
+      { id: 'credit-hub', name: 'self' },
+      { id: 'deepseek', name: 'official' },
+      { id: 'qoder', name: 'Qoder' },
+    ],
+    listModels: async provider => provider === 'qoder'
+      ? [{ id: 'glm-5', name: 'GLM 5', context: { contextWindow: 200000 }, defaultMaxTokens: 8192, inputModalities: ['text', 'image'] }]
+      : [],
+    stream: async function * (generate) {
+      seen.push(generate)
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: 'pk-hi' }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'pk-hi' } }
+      yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 4 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const bridge = createPackBridge({ warn: () => {} })
+  bridge.setLlm(fakeLlm)
+  const models = await bridge.listModels()
+  assert.equal(models.length, 1, 'only non-excluded providers bridged')
+  assert.equal(models[0].id, 'pk/qoder/glm-5')
+  assert.equal(models[0].vision, true)
+  assert.equal(models[0].contextWindow, 200000)
+
+  const chunks = []
+  const outcome = await bridge.streamTurn({
+    modelId: 'pk/qoder/glm-5',
+    options: { messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }], maxTokens: 777 },
+    signal: undefined,
+    onChunk: chunk => chunks.push(chunk),
+  })
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'pk-hi')
+  assert.equal(outcome.sawFinish, true)
+  assert.equal(outcome.finish, 'stop')
+  assert.equal(outcome.usage.outputTokens, 4)
+  assert.equal(seen[0].provider, 'qoder')
+  assert.equal(seen[0].model, 'glm-5')
+  assert.equal(seen[0].system, 'sys', 'system hoisted out of messages')
+  assert.equal(seen[0].messages.length, 1, 'system removed from chat messages')
+  assert.equal(seen[0].maxTokens, 777)
+
+  // max-tokens kind 归一化成 wire 形
+  const bridge2 = createPackBridge({})
+  bridge2.setLlm({ ...fakeLlm, stream: async function * () { yield { type: 'finish', reason: { kind: 'max-tokens' } } } })
+  const capped = await bridge2.streamTurn({ modelId: 'pk/qoder/glm-5', options: { messages: [] } })
+  assert.equal(capped.finish, 'max_tokens')
+
+  // hub 装配：pk 模型进目录并可直接调通
+  const workbuddy = makeSource('wb')
+  const upstreams = makeSource('up')
+  const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge: bridge, logger: console, warn: () => {} })
+  const rows = await hub.catalog(true)
+  assert(rows.some(r => r.id === 'pk/qoder/glm-5'))
+  const call = await hub.adapter.prepareCall('credit-hub', 'pk/qoder/glm-5')
+  const hubChunks = []
+  for await (const chunk of call.stream({ model: 'pk/qoder/glm-5', messages: [{ role: 'user', content: 'hi' }] })) hubChunks.push(chunk)
+  assert.equal(hubChunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'pk-hi')
+  assert(hubChunks.some(c => c.type === 'finish' && c.reason.kind === 'stop'))
+
   stores.dispose()
   await rmDir(dir)
 })

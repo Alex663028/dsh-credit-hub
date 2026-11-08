@@ -81,7 +81,7 @@ async function nextOrSilence(iterator, ms) {
   }
 }
 
-export function createHubRuntime({ stores, workbuddy, upstreams, packModels, logger, warn, recordTurn, settings: settingsFn }) {
+export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, packModels, logger, warn, recordTurn, settings: settingsFn }) {
   const settings = settingsFn ?? (() => stores.settings.load())
   const combos = () => {
     const data = stores.routes.load()
@@ -105,7 +105,11 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packModels, log
     try { entries.push(...await upstreams.listModels()) } catch (error) {
       warn?.(`credit-hub: 上游清单失败（${error?.message ?? error}）`)
     }
-    if (packModels) {
+    if (packBridge) {
+      try { entries.push(...await packBridge.listModels()) } catch (error) {
+        warn?.(`credit-hub: pack 桥接清单失败（${error?.message ?? error}）`)
+      }
+    } else if (packModels) {
       try { entries.push(...await packModels()) } catch {}
     }
     const rows = [...entries]
@@ -153,6 +157,9 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packModels, log
     }
     if (entry.source === 'upstream') {
       return upstreams.streamTurn({ modelId: entry.id, options, signal, onChunk })
+    }
+    if (entry.source === 'pack' && packBridge) {
+      return packBridge.streamTurn({ modelId: entry.id, options, signal, onChunk })
     }
     return Promise.reject(new UpstreamError(`credit-hub 不认识来源 "${entry.source}"`, CODE.client))
   }

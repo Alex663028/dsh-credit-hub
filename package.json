@@ -1,6 +1,6 @@
 {
   "name": "dsh-credit-hub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "积分汇通 — 把各家 coding agent 的账号积分渠道（WorkBuddy/CodeBuddy、Raccoon 商汤小浣熊、Qoder、ZCode、MiniMax、TRAE 等）与自填的官方 API / 任意 OpenAI 兼容中转，汇成一条统一模型车道与一个本地 OpenAI + Anthropic 兼容网关；含账号池、积分查询、降级链与用量看板。",
   "main": "./index.js",
@@ -22,7 +22,8 @@
     "icon.svg",
     "cordis.patch.yml",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "test"
   ],
   "keywords": [
     "dsh",

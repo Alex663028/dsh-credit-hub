@@ -17,6 +17,7 @@ import { createHubRuntime, ROUTE_MAIN } from './src/hub.js'
 import { startGateway } from './src/forward.js'
 import { createApiRoutes } from './src/api.js'
 import { mountAccountPack } from './src/pack-mount.js'
+import { createPackBridge } from './src/pack-bridge.js'
 import { createRing, now } from './src/util.js'
 
 const require = createRequire(import.meta.url)
@@ -33,6 +34,7 @@ try {
     gatewayPort: Schema.number().default(8330).description('本地网关端口'),
     accountPack: Schema.union(['auto', 'on', 'off']).default('auto').description('渠道包模式：auto 避让 ofm / on 独立反代 / off'),
     autoCheckin: Schema.boolean().default(false).description('WorkBuddy 每日自动签到'),
+    packGateway: Schema.boolean().default(false).description('渠道包自带 8326 网关（单网关策略下保持关闭）'),
   }).description('积分汇通')
 } catch {}
 
@@ -44,12 +46,15 @@ const SETTINGS_DEFAULTS = {
   gatewayPort: 8330,
   accountPack: 'auto',
   autoCheckin: false,
+  // 单网关策略：8330 已通过 pack 桥接汇总全部模型，渠道包自带的 8326
+  // 本地网关默认停用（进程级 env 硬开关，pack 的 RPC 也打不开）。
+  packGateway: false,
 }
 
 /** llm 是唯一硬依赖：没有它本插件无事可做，其余服务缺席只降级单个功能。 */
 export const inject = ['llm']
 
-const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs']
+const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs', 'packGateway']
 
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
@@ -67,8 +72,19 @@ export function apply(ctx, config = {}) {
   }
   let packStatus = { mounted: false, reason: 'pending' }
 
+  // 渠道包 8326 网关的进程级硬开关：必须在 pack 挂载前设置。pack 挂载是
+  // 异步的（ctx.inject 回调），这里同步先设，保证竞态安全。
+  if (settings().packGateway === false) {
+    process.env.DSH_OPENAI_GATEWAY_ENABLED = '0'
+    logger.info?.('credit-hub: 渠道包 8326 本地网关已按单网关策略停用（settings.packGateway）')
+  }
+
   const workbuddy = createWorkbuddyRuntime({ stores, log, warn })
   const upstreams = createUpstreamRuntime({ stores, log })
+  // 渠道包模型桥接：把宿主 llm 注册表里的渠道包 provider（raccoon/qoder/…）
+  // 以 `pk/<provider>/<model>` 并入目录；请求走 ctx.llm.stream 进程内转发。
+  const packBridge = createPackBridge({ logger, warn })
+  packBridge.setLlm(ctx.llm)
   // 逐模型用量（内存聚合，随进程生命周期）：模型 → {ok, failed, skipped, lastAt, tokens}
   const usageStats = new Map()
   const recordTurn = ({ model, ok, skipped, usage }) => {
@@ -82,8 +98,16 @@ export function apply(ctx, config = {}) {
     usageStats.set(model, row)
     log({ scope: 'turn', message: `${model}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}` })
   }
-  const hub = createHubRuntime({ stores, workbuddy, upstreams, logger, warn, recordTurn, settings })
+  const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
   const gateway = startGateway({ stores, hub, logger, settings })
+
+  // 目录变更广播：模型开关/上游/链路改动后通知宿主刷新选择器缓存。
+  // 宿主把各 provider 的模型目录缓存在本地——不广播的话，WB 等汇通模型的
+  // 开关在选择器里永远不生效（渠道包自己的 setDisabled 会广播，无需代劳）。
+  const broadcastCatalogChanged = () => {
+    try { ctx.llm?.emitAdaptersUpdated?.() } catch {}
+    try { ctx.emit?.('llm/adapters-updated') } catch {}
+  }
 
   // ── 模型车道注册 ───────────────────────────────────────────────────────────
   let registration
@@ -101,6 +125,7 @@ export function apply(ctx, config = {}) {
       stores, hub, workbuddy, upstreams, gateway, version,
       settingsKeys: SETTINGS_KEYS,
       packStatus: () => packStatus,
+      broadcast: broadcastCatalogChanged,
       usage: () => [...usageStats.entries()].map(([model, row]) => ({ model, ...row })).sort((a, b) => (b.ok + b.failed) - (a.ok + a.failed)).slice(0, 12),
       logs: () => logRing.list(),
       clearLogs: () => logRing.clear(),

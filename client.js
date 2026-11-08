@@ -60,6 +60,8 @@ window.__ModuleLoader__?.load({
     'ov.enabled': '启用积分汇通',
     'ov.gatewayToggle': '本地网关',
     'ov.autoCheckin': 'WorkBuddy 每日自动签到',
+    'ov.packGateway': '渠道包独立网关（8326）',
+    'ov.packGateway.hint': '关闭后 8330 单网关转出全部模型；开启则渠道包另起 8326 网关（与本插件功能重叠）。重启 DSH 后生效。',
     'ov.refresh': '刷新',
     'ov.pick.hint': '这些模型出现在聊天框模型选择器的「积分汇通」分组里',
     'ov.chips.hint': '点击开关模型（关闭后从选择器与网关隐藏，降级链不受影响）',
@@ -207,6 +209,8 @@ window.__ModuleLoader__?.load({
     'ov.enabled': 'Enable Credit Hub',
     'ov.gatewayToggle': 'Local gateway',
     'ov.autoCheckin': 'WorkBuddy daily check-in',
+    'ov.packGateway': 'Channel-pack gateway (8326)',
+    'ov.packGateway.hint': 'Off = single 8330 gateway serves every model. On = the channel pack also starts its own 8326 gateway (overlapping). Applies after restart.',
     'ov.refresh': 'Refresh',
     'ov.pick.hint': 'These models appear in the chat picker under "Credit Hub"',
 
@@ -536,6 +540,7 @@ window.__ModuleLoader__?.load({
             h(Toggle, { label: t('ov.enabled'), checked: settings.enabled !== false, onChange: value => onSettings({ enabled: value }) }),
             h(Toggle, { label: t('ov.gatewayToggle'), checked: settings.gatewayEnabled !== false, onChange: value => onSettings({ gatewayEnabled: value }) }),
             h(Toggle, { label: t('ov.autoCheckin'), checked: settings.autoCheckin === true, onChange: value => onSettings({ autoCheckin: value }) }),
+            h(Toggle, { label: t('ov.packGateway'), checked: settings.packGateway === true, onChange: value => onSettings({ packGateway: value }), title: t('ov.packGateway.hint') }),
             h(Btn, { small: true, onClick: load }, t('ov.refresh'))),
           h('div', { className: 'ch-muted', style: { marginTop: '8px' } }, t('ov.layer.hint'))))
     }

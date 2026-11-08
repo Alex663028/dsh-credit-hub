@@ -98,6 +98,7 @@ export function createApiRoutes(deps) {
           return { ...current, modelDisabled: map }
         })
         hub.invalidate()
+        deps.broadcast?.()
         return send(200, { id, disabled })
       }
       if (method === 'GET' && routePath === '/pack/probe') {
@@ -180,7 +181,10 @@ export function createApiRoutes(deps) {
         if (method === 'GET' && action === '/presets') return send(200, { presets: upstreams.presets })
         if (method === 'POST' && action === '/save') {
           const body = await readJson(req)
-          return send(200, { upstream: upstreams.upsert(body) })
+          const view = upstreams.upsert(body)
+          hub.invalidate()
+          deps.broadcast?.()
+          return send(200, { upstream: view })
         }
         if (method === 'POST' && action === '/install') {
           const body = await readJson(req)
@@ -190,18 +194,21 @@ export function createApiRoutes(deps) {
           const body = await readJson(req)
           upstreams.remove(String(body.id ?? ''))
           hub.invalidate()
+          deps.broadcast?.()
           return send(200, { upstreams: upstreams.list() })
         }
         if (method === 'POST' && action === '/enable') {
           const body = await readJson(req)
           upstreams.setEnabled(String(body.id ?? ''), body.enabled === true)
           hub.invalidate()
+          deps.broadcast?.()
           return send(200, { upstreams: upstreams.list() })
         }
         if (method === 'POST' && action === '/discover') {
           const body = await readJson(req)
           const found = await upstreams.discover(String(body.id ?? ''))
           hub.invalidate()
+          deps.broadcast?.()
           return send(200, { models: found })
         }
         return send(404, { error: 'not found' })
@@ -218,6 +225,7 @@ export function createApiRoutes(deps) {
           chain: (Array.isArray(row.chain) ? row.chain : []).map(String).filter(Boolean),
         })).filter(row => row.name && row.chain.length > 0)
         await hub.setCombos(clean)
+        deps.broadcast?.()
         return send(200, { combos: hub.combos() })
       }
 
