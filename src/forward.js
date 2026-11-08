@@ -261,7 +261,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       }
       res.write('data: [DONE]\n\n')
       res.end()
-      return { ok: failure === null, usage }
+      return { ok: failure === null, usage, error: failure ?? undefined }
     } catch (error) {
       // 不伪造成功收尾：错误对象并入最终帧；已交付的部分内容仍以 stop 收尾
       frame({
