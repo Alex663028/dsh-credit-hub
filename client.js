@@ -13,9 +13,11 @@
  * @module client.js
  */
 
+window.__chLoaded = (window.__chLoaded ?? 0) + 1
 window.__ModuleLoader__?.load({
   id: 'dsh-credit-hub',
   factory: require => {
+    window.__chFactoryRan = (window.__chFactoryRan ?? 0) + 1
     const React = require('react')
     const NS = 'settings.creditHub'
     const DICT = {
@@ -1421,6 +1423,7 @@ window.__ModuleLoader__?.load({
 
     // ── slot 注册 ──────────────────────────────────────────────────────────────
     const apply = ctx => {
+      window.__chApplyCount = (window.__chApplyCount ?? 0) + 1
       ctx.slots.inject('settings.section', () => ctx.slots.register({
         name: 'settings.section',
         id: 'credit-hub',
