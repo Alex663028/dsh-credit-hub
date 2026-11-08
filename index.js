@@ -10,6 +10,8 @@
  */
 
 import { createRequire } from 'node:module'
+import fs from 'node:fs'
+import path from 'node:path'
 import { createStores } from './src/store.js'
 import { createWorkbuddyRuntime } from './src/workbuddy.js'
 import { createUpstreamRuntime } from './src/aggregate.js'
@@ -67,10 +69,26 @@ export function apply(ctx, config = {}) {
   const patchConfig = config && typeof config === 'object' ? config : {}
   const settings = () => ({ ...SETTINGS_DEFAULTS, ...patchConfig, ...stores.settings.load() })
   const logRing = createRing(400)
-  const log = row => logRing.push({ at: now(), level: 'info', ...row })
+  // 落盘日志：JSONL 追加写（异步、失败静默），供离线排查——超过 1MB 轮换成 .old
+  const logFile = path.join(stores.dir, 'logs.jsonl')
+  const appendLog = row => {
+    try {
+      if (fs.existsSync(logFile) && fs.statSync(logFile).size > 1024 * 1024) {
+        fs.renameSync(logFile, `${logFile}.old`)
+      }
+      fs.appendFileSync(logFile, JSON.stringify(row) + '\n')
+    } catch {}
+  }
+  const log = row => {
+    const full = { at: now(), level: 'info', ...row }
+    logRing.push(full)
+    appendLog(full)
+  }
   const warn = message => {
     logger.warn?.(`credit-hub: ${message}`)
-    logRing.push({ at: now(), level: 'warn', message: String(message).slice(0, 500) })
+    const full = { at: now(), level: 'warn', message: String(message).slice(0, 500) }
+    logRing.push(full)
+    appendLog(full)
   }
   let packStatus = { mounted: false, reason: 'pending' }
 

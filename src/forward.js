@@ -708,7 +708,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           const result = body.stream === true
             ? await streamOpenAi(res, options, options.model, signal.signal)
             : await completeOpenAi(res, options, options.model, signal.signal)
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(result.error?.message ?? '').slice(0, 160)}`}` })
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${result.error ? String(result.error.message ?? JSON.stringify(result.error)).slice(0, 160) : '（无 error 信息——旧代码或中断）'}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
@@ -721,7 +721,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           const result = body.stream === true
             ? await streamClaude(res, options, options.model, signal.signal)
             : await completeClaude(res, options, options.model, signal.signal)
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(result.error?.message ?? '').slice(0, 160)}`}` })
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${result.error ? String(result.error.message ?? JSON.stringify(result.error)).slice(0, 160) : '（无 error 信息——旧代码或中断）'}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
