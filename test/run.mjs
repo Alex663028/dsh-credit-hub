@@ -316,6 +316,40 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
   assert.equal(seen[0].messages.length, 1, 'system removed from chat messages')
   assert.equal(seen[0].maxTokens, 777)
 
+  // 思考强度钳制：effort 必须落在宿主模型声明的档位集合内（Raccoon 适配器
+  // 对不支持思考的模型会直接抛 "does not support reasoning effort"）
+  await testAsync('pack bridge clamps reasoning effort to model menu', async () => {
+    const dir2 = tmpDir('ch-clamp-')
+    const genSeen = []
+    const menuLlm = {
+      listProviders: async () => [{ id: 'raccoon', name: 'Raccoon' }],
+      listModels: async () => [
+        { id: 'sn-reasoning', name: 'R', reasoning: { efforts: ['low', 'high'] } },
+        { id: 'sn-plain', name: 'P' },
+      ],
+      resolveModelInfo: async (provider, model) => model === 'sn-reasoning'
+        ? { reasoning: { efforts: ['low', 'high'] } }
+        : undefined,
+      stream: async function * (generate) {
+        genSeen.push(generate)
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }
+    const bridge2 = createPackBridge({ warn: () => {} })
+    bridge2.setLlm(menuLlm)
+    const stream = (model, effort) => bridge2.streamTurn({
+      modelId: `pk/raccoon/${model}`,
+      options: { messages: [{ role: 'user', content: 'hi' }], ...(effort !== undefined ? { reasoningEffort: effort } : {}) },
+      onChunk: () => {},
+    })
+    await stream('sn-reasoning', 'max')   // max → 钳到 high
+    await stream('sn-reasoning', 'low')   // low → 原样
+    await stream('sn-plain', 'high')      // 无思考菜单 → 整个去掉
+    await stream('sn-plain', undefined)   // 未指定 → 保持未指定
+    assert.deepEqual(genSeen.map(g => g.reasoningEffort), ['high', 'low', undefined, undefined])
+    await rmDir(dir2)
+  })
+
   // max-tokens kind 归一化成 wire 形
   const bridge2 = createPackBridge({})
   bridge2.setLlm({ ...fakeLlm, stream: async function * () { yield { type: 'finish', reason: { kind: 'max-tokens' } } } })

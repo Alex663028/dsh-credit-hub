@@ -95,6 +95,39 @@ export function createPackBridge({ logger, warn } = {}) {
     return out
   }
 
+  // 模型思考档位缓存：pkId → { efforts, defaultEffort }（无菜单 = 不支持思考）
+  const modelMeta = new Map()
+
+  /** 查宿主模型的思考档位菜单；查不到 = 无菜单（调用方 effort 应整个去掉）。 */
+  async function resolveMeta(provider, model) {
+    const key = `pk/${provider}/${model}`
+    if (modelMeta.has(key)) return modelMeta.get(key)
+    let meta = { efforts: undefined, defaultEffort: undefined }
+    try {
+      const info = await llm.resolveModelInfo?.(provider, model)
+      const r = info?.reasoning
+      if (r && Array.isArray(r.efforts) && r.efforts.length > 0) {
+        meta = { efforts: r.efforts, defaultEffort: r.defaultEffort }
+      }
+    } catch {}
+    modelMeta.set(key, meta)
+    return meta
+  }
+
+  const EFFORT_RANK = { off: 0, minimal: 1, low: 2, medium: 3, high: 4, xhigh: 5, max: 6 }
+
+  /** 请求档位钳制到模型受支持集合：不支持思考 → undefined（整个不发）。 */
+  function clampEffort(requested, meta) {
+    const list = meta?.efforts
+    if (!Array.isArray(list) || list.length === 0) return undefined
+    const requestedNorm = String(requested).toLowerCase()
+    if (requestedNorm === 'off') return list.includes('off') ? 'off' : undefined
+    if (list.includes(requestedNorm)) return requestedNorm
+    const reqRank = EFFORT_RANK[requestedNorm] ?? 4
+    const below = list.filter(effort => (EFFORT_RANK[effort] ?? 4) <= reqRank)
+    return below.length > 0 ? below[below.length - 1] : list[0]
+  }
+
   /**
    * One physical turn over the host llm service. Emits the same chunk
    * vocabulary `dispatch()` consumers already handle and resolves to
@@ -119,6 +152,15 @@ export function createPackBridge({ logger, warn } = {}) {
       .filter(Boolean)
       .join('\n\n')
     const chat = messages.filter(message => message?.role !== 'system' && message?.role !== 'developer')
+    // 思考强度钳制：调用方的 effort 必须落在该模型受支持的档位集合内——
+    // 模型不支持思考（无菜单）时整个去掉，否则 Raccoon 等适配器直接报
+    // "does not support reasoning effort"
+    let reasoningPatch = {}
+    if (options?.reasoningEffort !== undefined) {
+      const meta = await resolveMeta(route.provider, route.model)
+      const effort = clampEffort(String(options.reasoningEffort), meta)
+      if (effort !== undefined) reasoningPatch = { reasoningEffort: effort }
+    }
     const generate = {
       provider: route.provider,
       model: route.model,
@@ -128,7 +170,7 @@ export function createPackBridge({ logger, warn } = {}) {
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
       ...(Array.isArray(options?.stop) && options.stop.length > 0 ? { stop: options.stop } : {}),
       ...(Array.isArray(options?.tools) && options.tools.length > 0 ? { tools: options.tools } : {}),
-      ...(options?.reasoningEffort !== undefined ? { reasoningEffort: options.reasoningEffort } : {}),
+      ...reasoningPatch,
       // 会话透传：渠道包适配器按 sessionId 做配额/会话记账，缺了会退化成共享会话
       ...(typeof options?.sessionId === 'string' && options.sessionId !== '' ? { sessionId: options.sessionId } : {}),
       signal,
