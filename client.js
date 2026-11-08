@@ -13,11 +13,9 @@
  * @module client.js
  */
 
-window.__chLoaded = (window.__chLoaded ?? 0) + 1
 window.__ModuleLoader__?.load({
   id: 'dsh-credit-hub',
   factory: require => {
-    window.__chFactoryRan = (window.__chFactoryRan ?? 0) + 1
     const React = require('react')
     const NS = 'settings.creditHub'
     const DICT = {
@@ -1422,45 +1420,41 @@ window.__ModuleLoader__?.load({
 `
 
     // ── slot 注册 ──────────────────────────────────────────────────────────────
-    const apply = ctx => {
-      window.__chApplyCount = (window.__chApplyCount ?? 0) + 1
+    //
+    // 每个挂载点独立 try：任一槽位在当前 Harness 版本里不存在或选项不被接受，
+    // 都只损失那一个入口，绝不能连累设置页本身（宿主对槽位注册是严格校验的，
+    // 未知选项会抛错；此前 plugins.item 抛错把后面的 settings.section 一起带走，
+    // 表现就是「设置里找不到积分汇通」）。
+    //
+    // 只传各槽位声明过的选项（id/key、order、label）；locale 走 t() 已经本地化，
+    // 不需要额外选项。
+    const mount = (ctx, slot, options, component) => {
       try {
-        // ① 插件详情页的设置页（plugins.item，view: 'page'）——DSH 插件设置
-        //    的标准挂载点：详情页 renderSlot('plugins.item', {view:'page'}, {only: 本插件 id})
-        ctx.slots.inject('plugins.item', () => {
-          const reg = ctx.slots.register({
-            name: 'plugins.item',
-            id: 'dsh-credit-hub',
-            order: 30,
-            label: () => t('nav'),
-            locale: NS,
-            inject: () => {},
-          }, function CreditHubPluginPage(props) {
-            if (props?.view === 'summary') {
-              return h('div', { className: 'ch-muted', style: { padding: '4px 0' } }, t('nav') + ' · ' + t('tab.overview') + ' / ' + t('tab.channels') + ' / ' + t('tab.upstreams') + ' / ' + t('tab.gateway'))
-            }
-            return h(SettingsPage, { ctx })
-          })
-          window.__chRegResult = String(reg).slice(0, 200)
-          return reg
-        })
-        // ② 应用级设置导航（settings.section）——可选挂载点
-        ctx.slots.inject('settings.section', () => {
-          const reg = ctx.slots.register({
-            name: 'settings.section',
-            id: 'credit-hub',
-            order: 36,
-            label: () => t('nav'),
-            locale: NS,
-            inject: () => {},
-          }, () => h(SettingsPage, { ctx }))
-          window.__chRegResult = String(reg).slice(0, 200)
-          return reg
-        })
+        ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, ...options }, component))
+        return true
       } catch (error) {
-        window.__chApplyError = String(error?.stack ?? error).slice(0, 1200)
-        throw error
+        try { console.warn(`[credit-hub] 槽位 ${slot} 挂载失败：`, error) } catch {}
+        return false
       }
+    }
+
+    const apply = ctx => {
+      // ① 设置页主入口：「设置 → 积分汇通」（settings.section，list 槽）
+      mount(ctx, 'settings.section', {
+        id: 'credit-hub',
+        order: 36,
+        label: () => t('nav'),
+      }, () => h(SettingsPage, { ctx }))
+
+      // ② 插件详情页：本 bundle 的配置区（plugins.bundle.config，keyed 槽，
+      //    key 必须是包名）。只认 view: 'page'，其余视图不渲染自己那一份。
+      mount(ctx, 'plugins.bundle.config', {
+        key: 'dsh-credit-hub',
+        label: () => t('nav'),
+      }, function CreditHubBundleConfig(props) {
+        if (props?.view !== undefined && props.view !== 'page') return null
+        return h(SettingsPage, { ctx })
+      })
     }
 
     /** 测试钩子：渲染冒烟直接渲染各 tab 页面（不影响产品路径）。 */

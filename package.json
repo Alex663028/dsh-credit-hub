@@ -43,7 +43,9 @@
     "url": "https://github.com/Alex663028/dsh-credit-hub/issues"
   },
   "scripts": {
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs && node test/render-smoke.mjs",
+    "test:host": "node test/run.mjs",
+    "test:ui": "node test/render-smoke.mjs"
   },
   "dsh": {
     "bundle": {
