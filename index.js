@@ -79,7 +79,7 @@ export function apply(ctx, config = {}) {
     logger.info?.('credit-hub: 渠道包 8326 本地网关已按单网关策略停用（settings.packGateway）')
   }
 
-  const workbuddy = createWorkbuddyRuntime({ stores, log, warn })
+  const workbuddy = createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged: broadcastCatalogChanged })
   const upstreams = createUpstreamRuntime({ stores, log })
   // 渠道包模型桥接：把宿主 llm 注册表里的渠道包 provider（raccoon/qoder/…）
   // 以 `pk/<provider>/<model>` 并入目录；请求走 ctx.llm.stream 进程内转发。

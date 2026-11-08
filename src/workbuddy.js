@@ -160,7 +160,7 @@ function billingHeaders(account) {
   return headers
 }
 
-export function createWorkbuddyRuntime({ stores, log, warn }) {
+export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged }) {
   const logins = new Map()
   const refreshing = new Map()
   const modelCache = new Map()
@@ -264,6 +264,8 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
     list.push(account)
     writeAccounts(list)
     logins.delete(loginId)
+    // 登录成功 = 目录新增一个 realm 的模型池，调用方需刷新目录缓存
+    onAccountsChanged?.()
     return { status: 'done', account: publicView(account) }
   }
 
@@ -282,6 +284,7 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
     const list = readAccounts().filter(row => row.id !== account.id)
     list.push(account)
     writeAccounts(list)
+    onAccountsChanged?.()
     return publicView(account)
   }
 
@@ -431,6 +434,12 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
     const entry = entries.find(row => row.id === bare) ?? { id: bare, name: bare, contextWindow: 128000, maxOutput: 16384 }
     const warnings = []
     const messages = toChatMessages(options.messages, warnings)
+    // 国际版硬约束（wb2api payload.go 的 ensureConsoleSystem 同款）：首条消息
+    // 必须是 system，否则 400 11128 "first message is not system prompt"。
+    // 客户端不带 system 时前置一条中性提示。
+    if (realm === 'global' && !(messages.length > 0 && messages[0].role === 'system')) {
+      messages.unshift({ role: 'system', content: 'You are a helpful assistant.' })
+    }
     const budget = clamp(options.maxTokens ?? 8192, 256, entry.maxOutput ?? 16384)
     const body = repairWorkbuddyBody({
       model: bare,

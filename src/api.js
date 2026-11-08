@@ -156,11 +156,15 @@ export function createApiRoutes(deps) {
         if (method === 'POST' && action === '/remove') {
           const body = await readJson(req)
           await workbuddy.remove(String(body.id ?? ''))
+          hub.invalidate()
+          deps.broadcast?.()
           return send(200, { accounts: workbuddy.listAccounts() })
         }
         if (method === 'POST' && action === '/enable') {
           const body = await readJson(req)
           await workbuddy.setEnabled(String(body.id ?? ''), body.enabled === true)
+          hub.invalidate()
+          deps.broadcast?.()
           return send(200, { accounts: workbuddy.listAccounts() })
         }
         if (method === 'POST' && action === '/credits') {
