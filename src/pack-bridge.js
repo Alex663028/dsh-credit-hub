@@ -169,10 +169,23 @@ export function createPackBridge({ logger, warn } = {}) {
       provider: route.provider,
       model: route.model,
       messages: chat,
-      // 适配器可能无条件读取这些字段的 .length（如 tools.length）——
-      // 缺省字段一律补齐宿主 GenerateOptions 的默认形状
+      // 适配器可能无条件读取这些字段的 .length（Raccoon 对每个工具读
+      // tool.description.length 等）——缺省字段一律补齐宿主 GenerateOptions
+      // 的默认形状，且工具统一归一化为扁平定义（调用方可能是 OpenAI 包裹
+      // 格式，description 在 tool.function 里，顶层 undefined 必崩）
       system: systemText,
-      tools: Array.isArray(options?.tools) ? options.tools : [],
+      tools: (Array.isArray(options?.tools) ? options.tools : []).map(tool => {
+        const source = tool && typeof tool.function === 'object' && tool.function !== null ? tool.function : tool
+        const name = String(source?.name ?? '').trim()
+        if (!name) return null
+        return {
+          name,
+          description: typeof source?.description === 'string' ? source.description : '',
+          parameters: source?.parameters && typeof source.parameters === 'object' && !Array.isArray(source.parameters)
+            ? source.parameters
+            : { type: 'object', properties: {} },
+        }
+      }).filter(Boolean),
       stop: Array.isArray(options?.stop) ? options.stop : [],
       ...(Number.isFinite(options?.maxTokens) ? { maxTokens: options.maxTokens } : {}),
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),

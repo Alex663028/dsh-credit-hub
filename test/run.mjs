@@ -302,7 +302,7 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
   const chunks = []
   const outcome = await bridge.streamTurn({
     modelId: 'pk/qoder/glm-5',
-    options: { messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }], maxTokens: 777 },
+    options: { messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }], maxTokens: 777, tools: [{ type: 'function', function: { name: 'read_file' } }] },
     signal: undefined,
     onChunk: chunk => chunks.push(chunk),
   })
@@ -315,6 +315,11 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
   assert.equal(seen[0].system, 'sys', 'system hoisted out of messages')
   assert.equal(seen[0].messages.length, 1, 'system removed from chat messages')
   assert.equal(seen[0].maxTokens, 777)
+
+  // 工具归一化：OpenAI 包裹格式（description 在 function 里）→ 扁平定义，
+  // 无 description 的工具补空串——Raccoon 适配器无条件读 tool.description.length
+  assert.equal(seen[0]?.tools?.[0]?.description, '', 'openai-wrapped tool normalized to flat def with string description')
+  assert.equal(seen[0]?.tools?.[0]?.name, 'read_file')
 
   // 思考强度钳制：effort 必须落在宿主模型声明的档位集合内（Raccoon 适配器
   // 对不支持思考的模型会直接抛 "does not support reasoning effort"）
