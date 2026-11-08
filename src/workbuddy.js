@@ -164,6 +164,8 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
   const logins = new Map()
   const refreshing = new Map()
   const modelCache = new Map()
+  // 11102（模型被后端拒绝）负缓存：`<realm>/<modelId>` → 隐藏截止时间
+  const modelBlockUntil = new Map()
   let rotateCursor = 0
 
   const readAccounts = () => {
@@ -364,6 +366,16 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
       log?.(`credit-hub: workbuddy ${realm} v3/config 拉取失败（${error?.message ?? error}），先用静态清单`)
     }
     if (!entries) entries = staticCatalog
+    // 11102 负缓存：上游明确拒绝的模型在目录里隐藏 30 分钟（到期自动回验），
+    // 避免选择器/网关反复撞 "service info not found"
+    const cutoff = now()
+    for (const [key, until] of modelBlockUntil) {
+      if (until <= cutoff) modelBlockUntil.delete(key)
+    }
+    entries = entries.filter(entry => {
+      const blockedUntil = modelBlockUntil.get(`${realm}/${entry.id}`)
+      return blockedUntil === undefined || blockedUntil <= cutoff
+    })
     modelCache.set(realm, { entries, expiresAt: now() + 10 * 60_000 })
     return entries
   }
@@ -485,6 +497,11 @@ export function createWorkbuddyRuntime({ stores, log, warn }) {
           if (ok) continue
         }
         punish(account, verdict)
+        if (verdict === 'model-blocked') {
+          // 上游明确拒绝该模型（11102 等）：目录里隐藏 30 分钟，到期自动回验
+          modelBlockUntil.set(`${realm}/${bare}`, now() + 30 * 60_000)
+          modelCache.delete(realm)
+        }
         if (verdict !== 'model-rate' && verdict !== 'soft-rate' && verdict !== 'model-blocked') continue
         break
       }

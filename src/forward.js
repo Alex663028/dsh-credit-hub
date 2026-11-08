@@ -207,6 +207,7 @@ export function startGateway({ stores, hub, logger, settings }) {
     let toolIndex = 0
     let usage = null
     let finish = 'stop'
+    let failure = null
     let openTool = null
     try {
       for await (const chunk of call.stream({ ...options, signal })) {
@@ -232,12 +233,28 @@ export function startGateway({ stores, hub, logger, settings }) {
           usage = chunk.usage
         } else if (chunk.type === 'finish') {
           finish = finishToOpenAi(chunk.reason)
+          // hub 的错误收尾走 finish 块（不抛异常）——必须捕获，否则流以
+          // 干净的 stop 结束、零内容，调用方只能报 "empty response"
+          if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+            failure = chunk.reason?.failure ?? { message: chunk.reason?.kind === 'aborted' ? 'request aborted' : 'upstream error' }
+          }
         }
       }
-      frame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finish }], ...(usage ? { usage: openAiUsage(usage) } : {}) })
+      if (failure !== null) {
+        // 失败流：以 OpenAI 惯例的独立 error 帧终止（多数客户端会把它当
+        // APIError 抛出），已交付的部分内容仍带 stop 收尾
+        frame({
+          ...base,
+          choices: [{ index: 0, delta: {}, finish_reason: finish }],
+          ...(usage ? { usage: openAiUsage(usage) } : {}),
+          error: { message: String(failure.message ?? 'upstream error'), type: 'gateway_error', code: failure.code },
+        })
+      } else {
+        frame({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finish }], ...(usage ? { usage: openAiUsage(usage) } : {}) })
+      }
       res.write('data: [DONE]\n\n')
       res.end()
-      return { ok: true, usage }
+      return { ok: failure === null, usage }
     } catch (error) {
       // 不伪造成功收尾：错误对象并入最终帧；已交付的部分内容仍以 stop 收尾
       frame({
@@ -305,6 +322,7 @@ export function startGateway({ stores, hub, logger, settings }) {
     let openIndex = null
     let usage = { inputTokens: 0, outputTokens: 0 }
     let finish = 'end_turn'
+    let failure = null
     let openKind = null
     frame({ type: 'message_start', message: { id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model, content: [], usage: { input_tokens: 0, output_tokens: 0 } } })
     try {
@@ -341,7 +359,16 @@ export function startGateway({ stores, hub, logger, settings }) {
           usage = chunk.usage
         } else if (chunk.type === 'finish') {
           finish = chunk.reason?.kind === 'max-tokens' ? 'max_tokens' : 'end_turn'
+          // 错误收尾必须以 error 事件终止（Anthropic 协议），不能装作正常结束
+          if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+            failure = chunk.reason?.failure ?? { message: chunk.reason?.kind === 'aborted' ? 'request aborted' : 'upstream error' }
+          }
         }
+      }
+      if (failure !== null) {
+        frame({ type: 'error', error: { type: 'api_error', message: String(failure.message ?? 'upstream error') } })
+        res.end()
+        return { ok: false, usage }
       }
       if (openKind !== null) frame({ type: 'content_block_stop', index: openIndex })
       frame({ type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: { input_tokens: usage.inputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 } })

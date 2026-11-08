@@ -405,6 +405,20 @@ await testAsync('gateway e2e: openai/anthropic/combo/failover/usage-protocol/cus
   assert.equal(partial.choices[0].message.content, 'partial')
   assert.equal(partial.error?.type, 'gateway_error')
 
+  // 流式失败必须带 error 帧：不能以零内容的干净 stop 结束（否则调用方
+  // 只能报 "empty response from model (no_visible_content)"）
+  const failSse = await (await fetch(`${base}/v1/chat/completions`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/m1', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+  })).text()
+  assert(failSse.includes('"error"'), 'stream failure carries an error frame')
+  assert(failSse.includes('[DONE]'))
+  assert(!failSse.includes('"content":"wb-a"'), 'no phantom content before failure')
+  const failClaudeSse = await (await fetch(`${base}/v1/messages`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/m1', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  })).text()
+  assert(failClaudeSse.includes('event: error'), 'anthropic stream failure carries error event')
+  assert(!failClaudeSse.includes('message_stop'), 'error terminates before a clean message_stop')
+
   // 自定义 Key：立即生效 + 重启持久化
   const newKey = await gateway.setKey('my-custom-relay-key-2026')
   assert.equal((await fetch(`${base}/v1/models`, { headers: { authorization: `Bearer ${gateway.key()}` } })).status, 200)
