@@ -33198,7 +33198,6 @@ var QODER_FALLBACK_MODELS = [
 
   // ⚠️ Qoduck（上游新模型，dsh-credit-hub 占位 2026-11-08）：id/档位/窗口未实测
   // ——若 112 model_error 则 id 不对，需从 Qoder 客户端网络面板抓真实 id
-  { id: "qoduck", name: "Qoduck", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "high", supportsDisable: true },
   { id: "dmodel", name: "DeepSeek-V4-Pro", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.5, efforts: ["high", "max"], defaultEffort: "max", supportsDisable: true },
   { id: "dfmodel", name: "DeepSeek-Flash", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "max", supportsDisable: true },
   { id: "mmodel", name: "MiniMax-M3", contextWindow: 1e6, supportsImage: true, supportsThinking: false, priceFactor: 0.2 }
@@ -33206,7 +33205,6 @@ var QODER_FALLBACK_MODELS = [
   // ⚠️ 新模型占位（dsh-credit-hub 2026-11-08）：上游已上线 Qoduck，官方 catalog
   // 的档位/倍率/窗口**未实测**——以下为占位值（对齐 1M 档惯例），接入后按
   // catalog 复核；若上游真实 id 与此不同（报 model not found），改本行 id 即可。
-  { id: "qoduck", name: "Qoduck", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 1, efforts: ["xhigh", "high", "low", "max", "medium"], defaultEffort: "high", supportsDisable: true }
 ];
 var QODER = {
   id: "qoder",
@@ -33356,7 +33354,10 @@ var QODER_CN_FALLBACK_MODELS = [
   // ⚠️ 版本是 **M2.7**（国际版 M3），且 CN 的 `is_vl` 为 false，故两个标记都不写。
   // ⚠️ 唯一档位表只有 200K 一档的 CN 模型 —— 不要跟着其它条改成 1M。
   // ⚠️ 目录里也**没有 `thinking_config`** → 不可选档位（与 IDE「不支持」一致）。
-  { id: "mmodel", name: "MiniMax-M2.7", contextWindow: 2e5, priceFactor: 0.2 }
+  { id: "mmodel", name: "MiniMax-M2.7", contextWindow: 2e5, priceFactor: 0.2 },
+
+  // ⚠️ Qoduck（上游新模型，dsh-credit-hub 占位 2026-11-08）：id/档位未实测——若 112 则 id 不对
+  { id: "qoduck", name: "Qoduck", contextWindow: 1e6, supportsImage: true, supportsThinking: true, priceFactor: 0.1, efforts: ["high", "max", "low"], defaultEffort: "high", supportsDisable: true },
 ];
 var QODER_CN = {
   // ⚠️ id 不带连字符：它同时是 cordis 服务名（`qodercnAuth`）、LLM 路由名
