@@ -313,7 +313,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       ...(usage ? { usage: openAiUsage(usage) } : {}),
       ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
     })
-    return { ok: !failure, usage }
+    return { ok: !failure, usage, error: failure ?? undefined }
   }
 
   async function streamClaude(res, options, model, signal) {
@@ -375,7 +375,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       if (failure !== null) {
         frame({ type: 'error', error: { type: 'api_error', message: String(failure.message ?? 'upstream error') } })
         res.end()
-        return { ok: false, usage }
+        return { ok: false, usage, error: failure }
       }
       if (openKind !== null) frame({ type: 'content_block_stop', index: openIndex })
       frame({ type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: { input_tokens: usage.inputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 } })
@@ -423,7 +423,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       usage: { input_tokens: usage?.inputTokens ?? 0, output_tokens: usage?.outputTokens ?? 0 },
       ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
     })
-    return { ok: !failure, usage }
+    return { ok: !failure, usage, error: failure ?? undefined }
   }
 
   const safeParse = text => {
@@ -524,7 +524,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       ...(finishToken === 'max_tokens' && !failure ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
       ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
     })
-    return { ok: !failure, usage }
+    return { ok: !failure, usage, error: failure ?? undefined }
   }
 
   async function streamResponses(res, options, model, signal) {
@@ -613,7 +613,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       if (failure !== null) {
         frame('response.failed', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', model, output, error: { message: String(failure.message ?? 'upstream error'), type: 'gateway_error' } } })
         res.end()
-        return { ok: false, usage }
+        return { ok: false, usage, error: failure }
       }
       frame('response.completed', {
         type: 'response.completed',
