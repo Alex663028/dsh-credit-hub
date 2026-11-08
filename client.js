@@ -1424,13 +1424,18 @@ window.__ModuleLoader__?.load({
     // ── slot 注册 ──────────────────────────────────────────────────────────────
     const apply = ctx => {
       window.__chApplyCount = (window.__chApplyCount ?? 0) + 1
-      ctx.slots.inject('settings.section', () => ctx.slots.register({
-        name: 'settings.section',
-        id: 'credit-hub',
-        order: 36,
-        label: () => t('nav'),
-        locale: NS,
-      }, () => h(SettingsPage, { ctx })))
+      try {
+        ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: 'credit-hub',
+          order: 36,
+          label: () => t('nav'),
+          locale: NS,
+        }, () => h(SettingsPage, { ctx })))
+      } catch (error) {
+        window.__chApplyError = String(error?.stack ?? error).slice(0, 1200)
+        throw error
+      }
     }
 
     /** 测试钩子：渲染冒烟直接渲染各 tab 页面（不影响产品路径）。 */
