@@ -856,6 +856,7 @@ window.__ModuleLoader__?.load({
       const { available, rpc } = useChannelRpc(ctx)
       const [summary, setSummary] = useState(null)
       const [hubModels, setHubModels] = useState([])
+      const [toast, showToast] = useToast()
       useEffect(() => {
         void api('/summary').then(setSummary).catch(() => {})
         void api('/models').then(payload => setHubModels(payload.models ?? [])).catch(() => {})
@@ -885,7 +886,8 @@ window.__ModuleLoader__?.load({
         h('div', { className: 'ch-cards-grid' }, CHANNEL_PROVIDERS.map((channel, index) => h(PackChannelCard, {
           key: channel.id, channel: { ...channel, offset: (index % 5) * 3000 }, rpc: available ? rpc : null, packNote,
         }))),
-        h(BridgeModelsCard, { hubModels }))
+        h(BridgeModelsCard, { hubModels }),
+        h(Toast, { toast }))
     }
 
     // ── 桥接渠道模型开关（宿主注册 provider：deepseek-account/tokenrhythm/…） ──
@@ -906,13 +908,15 @@ window.__ModuleLoader__?.load({
       return h(Card, { title: t('bridge.title'), accent: '#7a6cf0', badge: h('span', { className: 'ch-org' }, t('bridge.hint')) },
         h('div', { className: 'ch-rows' }, providers.map(provider => h('div', { className: 'ch-uppanel', key: provider },
           h('div', { className: 'ch-row', style: { marginBottom: '8px' } }, h('b', null, provider)),
-          h('div', { className: 'ch-rows' }, grouped[provider].models.map(model => h('div', { className: 'ch-rowline', key: model.id },
+          // grouped[provider] 本身就是模型数组（上面按 provider 分桶），不是 {models: [...]}
+          h('div', { className: 'ch-rows' }, grouped[provider].map(model => h('div', { className: 'ch-rowline', key: model.id },
             h('div', { className: 'ch-rowline-main' },
               h('code', null, model.modelId ?? model.id),
               model.disabled === true ? h(StateBadge, { text: t('chan.model.hidden') }) : null),
             h('div', { className: 'ch-rowline-actions' },
               h(Btn, { small: true, kind: model.disabled === true ? 'primary' : undefined, onClick: () => toggle(model) },
-                model.disabled === true ? t('chan.model.on') : t('chan.model.off'))))))))))
+                model.disabled === true ? t('chan.model.on') : t('chan.model.off'))))))))),
+        h(Toast, { toast }))
     }
 
     // ── API 中转 ───────────────────────────────────────────────────────────────
@@ -1468,6 +1472,13 @@ window.__ModuleLoader__?.load({
         combos: () => h(CombosPage),
         gateway: () => h(GatewayPage, { settings: testSettings, onSettings: () => {} }),
         logs: () => h(LogsPage),
+      },
+      // 子组件直测：页面在「数据已加载」的第二次渲染才暴露的崩溃（首帧空态
+      // 走 early-return 不执行那条路径），必须用带数据的 props 单独覆盖。
+      components: {
+        BridgeModelsCard,
+        PackChannelCard,
+        WorkBuddyCard,
       },
     }
 

@@ -145,6 +145,44 @@ for (const [label, make] of cases) {
   }
 }
 
+// ── 子组件「带数据」渲染：页面首帧空态会 early-return，真正的崩溃只在
+//    数据加载后的第二次渲染才出现（渠道页 BridgeModelsCard 就是这种） ────────
+const components = renderTest.components ?? {}
+const hubModels = [
+  { id: 'pk/tokenrhythm/deepseek-v4.1-flash-1017', provider: 'tokenrhythm', modelId: 'deepseek-v4.1-flash-1017', disabled: false, source: 'pack' },
+  { id: 'pk/zcode/GLM-5.3', provider: 'zcode', modelId: 'GLM-5.3', disabled: true, source: 'pack' },
+  { id: 'wb/cn/glm-5.3-flash', provider: 'workbuddy', modelId: 'glm-5.3-flash', disabled: false, source: 'workbuddy' },
+]
+const richCases = [
+  ['桥接模型卡（有数据）', () => React.createElement(components.BridgeModelsCard ?? (() => null), { hubModels })],
+  ['渠道卡（有 10 个渠道 + RPC）', () => React.createElement(
+    components.PackChannelCard ?? (() => null),
+    { channel: { id: 'qoder', name: 'Qoder', org: '阿里系', accent: '#615CED', offset: 0 }, rpc: async () => ({}), packNote: 'note' },
+  )],
+  ['渠道卡（RPC 不可用）', () => React.createElement(
+    components.PackChannelCard ?? (() => null),
+    { channel: { id: 'zcode', name: 'ZCode', org: '智谱', accent: '#3B6EF6' }, rpc: null, packNote: null },
+  )],
+]
+for (const [label, make] of richCases) {
+  try {
+    render(make(), label)
+    ok(`${label} 渲染通过`)
+  } catch (error) {
+    fail(`${label}：${error?.message ?? error}`)
+  }
+}
+
+// ── 目录渲染：空态与有数据两种都必须过 ──────────────────────────────────────
+for (const [label, hub] of [['空目录'], ['有 3 个模型的目录', hubModels]]) {
+  try {
+    render(React.createElement(components.BridgeModelsCard ?? (() => null), { hubModels: hub }), label)
+    ok(`桥接卡 ${label} 渲染通过`)
+  } catch (error) {
+    fail(`桥接卡 ${label}：${error?.message ?? error}`)
+  }
+}
+
 // ── apply() 的槽位注册参数校验 ──────────────────────────────────────────────
 const ALLOWED = {
   'settings.section': ['id', 'order', 'label'],
