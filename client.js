@@ -1425,13 +1425,17 @@ window.__ModuleLoader__?.load({
     const apply = ctx => {
       window.__chApplyCount = (window.__chApplyCount ?? 0) + 1
       try {
-        ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: 'credit-hub',
-          order: 36,
-          label: () => t('nav'),
-          locale: NS,
-        }, () => h(SettingsPage, { ctx })))
+        ctx.slots.inject('settings.section', () => {
+          const reg = ctx.slots.register({
+            name: 'settings.section',
+            id: 'credit-hub',
+            order: 36,
+            label: () => t('nav'),
+            locale: NS,
+          }, () => h(SettingsPage, { ctx }))
+          window.__chRegResult = String(reg).slice(0, 200)
+          return reg
+        })
       } catch (error) {
         window.__chApplyError = String(error?.stack ?? error).slice(0, 1200)
         throw error
