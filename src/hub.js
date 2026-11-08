@@ -261,6 +261,12 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     async * runStream(options, pinned, rows) {
       const currentRows = rows ?? await catalog()
       const entry = pinned ?? currentRows.find(row => row.id === options.model) ?? null
+      // 简单客户端兼容：调用方未指定思考强度且设置开启时，思考模型默认关思考——
+      // 否则思考阶段没有可见输出，只会渲染 content 的客户端表现为"没响应"
+      if (entry !== null && entry.reasoning === true
+        && settings().thinkingOffByDefault === true && options.reasoningEffort === undefined) {
+        options = { ...options, reasoningEffort: 'off' }
+      }
       if (entry !== null && entry.source === 'combo') {
         yield * this.runCombo(options, entry, currentRows)
         return

@@ -419,6 +419,36 @@ await testAsync('gateway e2e: openai/anthropic/combo/failover/usage-protocol/cus
   assert(failClaudeSse.includes('event: error'), 'anthropic stream failure carries error event')
   assert(!failClaudeSse.includes('message_stop'), 'error terminates before a clean message_stop')
 
+  // Responses 线（/v1/responses，Codex wire——EKKO 等经 codex-proxy 的 agent）：
+  // 非流式（含 function_call 输出）+ 流式事件序列 + x-api-key 鉴权
+  // 注：先把上游 fake 恢复健康（上一段测试把它换成了抛异常版本）
+  upstreams.streamTurn = async ({ onChunk }) => {
+    onChunk({ type: 'block-start', index: 0, blockType: 'text' })
+    onChunk({ type: 'text-delta', index: 0, text: 'up-answer' })
+    onChunk({ type: 'block-end', index: 0, block: { type: 'text', text: 'up-answer' } })
+    return { sawText: true, sawFinish: true, finish: 'stop', usage: { inputTokens: 5, outputTokens: 2 }, nextIndex: 1 }
+  }
+  const resp = await (await fetch(`${base}/v1/responses`, {
+    method: 'POST', headers: auth, body: JSON.stringify({
+      model: 'wb/m1', input: 'read /tmp/a.txt', max_output_tokens: 500,
+      tools: [{ type: 'function', name: 'read_file', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
+    }),
+  })).json()
+  assert.equal(resp.status, 'completed')
+  const callItem = resp.output.find(item => item.type === 'function_call')
+  assert.equal(callItem?.name, 'read_file', 'responses wire emits function_call items')
+  const msgItem = resp.output.find(item => item.type === 'message')
+  assert.equal(msgItem?.content?.[0]?.type, 'output_text')
+  assert.equal(resp.usage.total_tokens, 7)
+
+  const respStream = await (await fetch(`${base}/v1/responses`, {
+    method: 'POST', headers: { 'x-api-key': gateway.key(), 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'up/m1', input: 'say OK', stream: true }),
+  })).text()
+  assert(respStream.includes('event: response.created'), 'responses stream opens with created')
+  assert(respStream.includes('response.output_text.delta'), 'text deltas emitted')
+  assert(respStream.includes('event: response.completed'), 'responses stream completes')
+
   // 自定义 Key：立即生效 + 重启持久化
   const newKey = await gateway.setKey('my-custom-relay-key-2026')
   assert.equal((await fetch(`${base}/v1/models`, { headers: { authorization: `Bearer ${gateway.key()}` } })).status, 200)
@@ -462,6 +492,34 @@ await testAsync('apply() boots with a mock host ctx', async () => {
   }
   if (previousHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = previousHome
+  await rmDir(dir)
+})
+
+// ── thinkingOffByDefault：简单客户端兼容开关 ────────────────────────────────
+await testAsync('thinking default-off applies only when caller omits effort', async () => {
+  const dir = tmpDir('ch-think-')
+  const stores = createStores(dir)
+  const seen = []
+  const workbuddy = {
+    listModels: async () => [{ id: 'wb/cn/glm-5.3', source: 'workbuddy', name: 'GLM', contextWindow: 100000, maxOutput: 8192, reasoning: true }],
+    streamTurn: async ({ options }) => { seen.push(options.reasoningEffort); return { sawText: true, sawFinish: true, finish: 'stop', usage: { inputTokens: 1, outputTokens: 1 }, nextIndex: 0 } },
+    status: () => ({ accounts: 1, ok: 1 }),
+  }
+  const upstreams = { listModels: async () => [], streamTurn: async () => {}, status: () => ({}) }
+  const hub = createHubRuntime({ stores, workbuddy, upstreams, logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const call = await hub.adapter.prepareCall('credit-hub', 'wb/cn/glm-5.3')
+  for await (const chunk of call.stream({ model: 'wb/cn/glm-5.3', messages: [{ role: 'user', content: 'hi' }] })) void chunk
+  assert.equal(seen[0], undefined, 'default: no forced effort')
+  stores.settings.update(s => ({ ...s, thinkingOffByDefault: true }))
+  hub.invalidate()
+  const call2 = await hub.adapter.prepareCall('credit-hub', 'wb/cn/glm-5.3')
+  for await (const chunk of call2.stream({ model: 'wb/cn/glm-5.3', messages: [{ role: 'user', content: 'hi' }] })) void chunk
+  assert.equal(seen[1], 'off', 'toggle on → effort off')
+  // 调用方显式指定时尊重调用方
+  const call3 = await hub.adapter.prepareCall('credit-hub', 'wb/cn/glm-5.3')
+  for await (const chunk of call3.stream({ model: 'wb/cn/glm-5.3', messages: [{ role: 'user', content: 'hi' }], reasoningEffort: 'high' })) void chunk
+  assert.equal(seen[2], 'high', 'explicit effort wins over toggle')
+  stores.dispose()
   await rmDir(dir)
 })
 

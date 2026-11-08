@@ -155,6 +155,7 @@ window.__ModuleLoader__?.load({
     'gw.key': '网关 Key',
     'gw.show': '显示',
     'gw.hide': '隐藏',
+    'gw.thinkingOff': '思考模型默认关思考（调用方未指定强度时——简单客户端即时出字）',
     'gw.setKey': '自定义 Key（16-80 位字母数字，立即生效）',
     'gw.keyApplied': 'Key 已生效，本机 agent 用新 Key 即可',
     'gw.rotate': '重置 Key',
@@ -309,6 +310,7 @@ window.__ModuleLoader__?.load({
     'gw.key': 'Gateway key',
     'gw.show': 'Show',
     'gw.hide': 'Hide',
+    'gw.thinkingOff': 'Default thinking OFF when caller omits effort (instant text for simple clients)',
     'gw.setKey': 'Custom key (16-80 alnum chars, effective immediately)',
     'gw.keyApplied': 'Key updated — local agents can use the new key now',
     'gw.rotate': 'Reset key',
@@ -1206,6 +1208,7 @@ window.__ModuleLoader__?.load({
         h(Card, { title: t('tab.gateway'), accent: running ? '#31b573' : '#8a93a8', badge: h(StateBadge, { state: running ? 'ok' : 'off', text: running ? t('gw.running') : t('gw.stopped') }) },
           h('div', { className: 'ch-row' },
             h(Toggle, { label: t('ov.gatewayToggle'), checked: settings.gatewayEnabled !== false, onChange: value => onSettings({ gatewayEnabled: value }) }),
+            h(Toggle, { label: t('gw.thinkingOff'), checked: settings.thinkingOffByDefault === true, onChange: value => onSettings({ thinkingOffByDefault: value }) }),
             h('span', { className: 'ch-field-label' }, t('gw.port')),
             h('input', { className: 'ch-input', style: { width: '90px' }, type: 'number', value: port, onChange: e => setPort(e.target.value) }),
             h(Btn, { small: true, onClick: () => {

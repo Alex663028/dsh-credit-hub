@@ -13,8 +13,13 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { mintKey, keyMatches } from './store.js'
-import { now } from './util.js'
+import { now, mintId } from './util.js'
 import { CODE } from './http.js'
+
+/** hub finish 块 → Responses 线的完成 token。 */
+const outcomeFinishToken = reason => reason?.kind === 'max-tokens' ? 'max_tokens'
+  : reason?.kind === 'stop' ? 'stop'
+  : reason?.kind ?? 'stop'
 
 /** harness usage → OpenAI 线上协议字段（prompt/completion/total_tokens）。 */
 const openAiUsage = usage => usage ? {
@@ -93,7 +98,9 @@ export function startGateway({ stores, hub, logger, settings }) {
   const authorized = req => {
     const header = String(req.headers.authorization ?? '')
     const presented = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
-    return keyMatches(presented, apiKey)
+    if (presented && keyMatches(presented, apiKey)) return true
+    // codex 系代理可能把 Key 放在 x-api-key 而非 Authorization
+    return keyMatches(String(req.headers['x-api-key'] ?? ''), apiKey)
   }
 
   // ── harness options ← external wire bodies ────────────────────────────────
@@ -423,6 +430,188 @@ export function startGateway({ stores, hub, logger, settings }) {
     try { return JSON.parse(text) } catch { return { _raw: text } }
   }
 
+  // ── OpenAI Responses 线（/v1/responses，Codex wire——EKKO 等 codex 系 agent） ──
+  const responsesInputToHarness = body => {
+    const messages = []
+    if (typeof body.instructions === 'string' && body.instructions) messages.push({ role: 'system', content: body.instructions })
+    const input = body.input
+    if (typeof input === 'string') {
+      messages.push({ role: 'user', content: input })
+      return messages
+    }
+    for (const item of Array.isArray(input) ? input : []) {
+      if (item?.type === 'message') {
+        const role = item.role === 'assistant' ? 'assistant'
+          : item.role === 'system' || item.role === 'developer' ? 'system' : 'user'
+        if (typeof item.content === 'string') { messages.push({ role, content: item.content }); continue }
+        const blocks = []
+        for (const part of Array.isArray(item.content) ? item.content : []) {
+          if (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'text') blocks.push({ type: 'text', text: String(part.text ?? '') })
+          else if (part?.type === 'input_image' && typeof part.image_url === 'string') blocks.push({ type: 'image', image: part.image_url })
+        }
+        if (blocks.length > 0) messages.push({ role, content: blocks })
+        continue
+      }
+      if (item?.type === 'function_call') {
+        messages.push({
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: String(item.call_id ?? item.id ?? mintId('call')), name: String(item.name ?? ''), arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}) }],
+        })
+        continue
+      }
+      if (item?.type === 'function_call_output') {
+        messages.push({
+          role: 'tool',
+          content: [{ type: 'tool-result', toolCallId: String(item.call_id ?? ''), content: [{ type: 'text', text: String(item.output ?? '') }] }],
+        })
+        continue
+      }
+      // reasoning 等内部项不回传上游
+    }
+    return messages
+  }
+
+  const responsesToolsToHarness = tools => (Array.isArray(tools) ? tools : [])
+    .filter(tool => tool?.type === 'function' || tool?.name)
+    .map(tool => ({
+      name: String(tool.name ?? ''),
+      description: typeof tool.description === 'string' ? tool.description : '',
+      parameters: tool.parameters && typeof tool.parameters === 'object' ? tool.parameters : { type: 'object', properties: {} },
+    }))
+
+  async function completeResponses(res, options, model, signal) {
+    const call = await hub.adapter.prepareCall(hub.route, model)
+    let text = ''
+    let reasoning = ''
+    const calls = []
+    let usage = null
+    let failure = null
+    let finishToken = 'stop'
+    try {
+      for await (const chunk of call.stream({ ...options, signal })) {
+        if (chunk.type === 'text-delta') text += chunk.text
+        else if (chunk.type === 'reasoning-delta') reasoning += chunk.text
+        else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+          calls.push({ id: chunk.block.id, name: chunk.block.name, arguments: chunk.block.arguments })
+        } else if (chunk.type === 'usage') usage = chunk.usage
+        else if (chunk.type === 'finish') {
+          finishToken = outcomeFinishToken(chunk.reason)
+          if (chunk.reason?.kind === 'error') failure = chunk.reason.failure
+        }
+      }
+    } catch (error) {
+      failure = failure ?? { message: String(error?.message ?? 'gateway error') }
+    }
+    const output = []
+    if (reasoning) output.push({ type: 'reasoning', id: `rs_${Date.now().toString(36)}`, summary: [] })
+    for (const callEntry of calls) {
+      output.push({ type: 'function_call', id: callEntry.id || mintId('fc'), call_id: callEntry.id, name: callEntry.name, arguments: callEntry.arguments })
+    }
+    output.push({ type: 'message', role: 'assistant', id: `msg_${Date.now().toString(36)}`, content: [{ type: 'output_text', text, annotations: [] }] })
+    const empty = text === '' && calls.length === 0
+    send(res, failure && empty ? 502 : 200, {
+      id: `resp_${Date.now().toString(36)}`,
+      object: 'response',
+      created_at: Math.floor(Date.now() / 1000),
+      status: failure ? 'failed' : 'completed',
+      model,
+      output,
+      usage: {
+        input_tokens: usage?.inputTokens ?? 0,
+        output_tokens: usage?.outputTokens ?? 0,
+        total_tokens: (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0),
+      },
+      ...(finishToken === 'max_tokens' && !failure ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+      ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
+    })
+    return { ok: !failure, usage }
+  }
+
+  async function streamResponses(res, options, model, signal) {
+    const call = await hub.adapter.prepareCall(hub.route, model)
+    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', connection: 'keep-alive', 'x-accel-buffering': 'no' })
+    const responseId = `resp_${Date.now().toString(36)}`
+    const frame = (event, payload) => res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
+    let outputIndex = 0
+    const output = []
+    let usage = null
+    let failure = null
+    let finishToken = 'completed'
+    frame('response.created', { type: 'response.created', response: { id: responseId, object: 'response', status: 'in_progress', model, output: [] } })
+    let messageItemId = null
+    let openTool = null
+    let currentText = ''
+    const openMessage = () => {
+      if (messageItemId !== null) return
+      messageItemId = `msg_${Date.now().toString(36)}${outputIndex}`
+      frame('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'message', role: 'assistant', id: messageItemId, content: [] } })
+      frame('response.content_part.added', { type: 'response.content_part.added', item_id: messageItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } })
+    }
+    const closeMessage = () => {
+      if (messageItemId === null) return
+      frame('response.content_part.done', { type: 'response.content_part.done', item_id: messageItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: currentText, annotations: [] } })
+      frame('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { type: 'message', role: 'assistant', id: messageItemId, content: [{ type: 'output_text', text: currentText, annotations: [] }] } })
+      output.push({ type: 'message', role: 'assistant', id: messageItemId, content: [{ type: 'output_text', text: currentText, annotations: [] }] })
+      outputIndex += 1
+      messageItemId = null
+      currentText = ''
+    }
+    const emitToolCall = block => {
+      closeMessage()
+      const callId = block.id || mintId('fc')
+      frame('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'function_call', id: callId, call_id: callId, name: block.name, arguments: '' } })
+      frame('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', item_id: callId, output_index: outputIndex, delta: block.arguments })
+      frame('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', item_id: callId, output_index: outputIndex, arguments: block.arguments })
+      frame('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { type: 'function_call', id: callId, call_id: callId, name: block.name, arguments: block.arguments } })
+      output.push({ type: 'function_call', id: callId, call_id: callId, name: block.name, arguments: block.arguments })
+      outputIndex += 1
+    }
+    try {
+      for await (const chunk of call.stream({ ...options, signal })) {
+        if (signal.aborted) break
+        if (chunk.type === 'text-delta') {
+          openMessage()
+          currentText += chunk.text
+          frame('response.output_text.delta', { type: 'response.output_text.delta', item_id: messageItemId, output_index: outputIndex, content_index: 0, delta: chunk.text })
+        } else if (chunk.type === 'reasoning-delta') {
+          // Codex 线：推理增量作为 reasoning summary delta 透传（客户端不渲染也无碍）
+          if (messageItemId === null) {
+            frame('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: 'rs', output_index: outputIndex, delta: chunk.text })
+          }
+        } else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+          emitToolCall(chunk.block)
+        } else if (chunk.type === 'usage') {
+          usage = chunk.usage
+        } else if (chunk.type === 'finish') {
+          finishToken = outcomeFinishToken(chunk.reason)
+          if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+            failure = chunk.reason?.failure ?? { message: chunk.reason?.kind === 'aborted' ? 'request aborted' : 'upstream error' }
+          }
+        }
+      }
+      closeMessage()
+      if (failure !== null) {
+        frame('response.failed', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', model, output, error: { message: String(failure.message ?? 'upstream error'), type: 'gateway_error' } } })
+        res.end()
+        return { ok: false, usage }
+      }
+      frame('response.completed', {
+        type: 'response.completed',
+        response: {
+          id: responseId, object: 'response', status: 'completed', model, output,
+          usage: { input_tokens: usage?.inputTokens ?? 0, output_tokens: usage?.outputTokens ?? 0, total_tokens: (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) },
+          ...(finishToken === 'max_tokens' ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
+        },
+      })
+      res.end()
+      return { ok: true, usage }
+    } catch (error) {
+      frame('response.failed', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', model, output, error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error' } } })
+      res.end()
+      return { ok: false, error }
+    }
+  }
+
   // ── server ────────────────────────────────────────────────────────────────
   async function start() {
     if (servers.length > 0) return bind()
@@ -453,6 +642,27 @@ export function startGateway({ stores, hub, logger, settings }) {
             object: 'list',
             data: rows.filter(entry => entry.disabled !== true).map(entry => ({ id: entry.id, object: 'model', owned_by: 'credit-hub', created: 0 })),
           })
+        }
+        if (req.method === 'POST' && (routePath === '/v1/responses' || routePath === '/responses')) {
+          const body = JSON.parse((await readBody(req)) || '{}')
+          const tools = responsesToolsToHarness(body.tools)
+          const options = {
+            model: String(body.model ?? ''),
+            messages: responsesInputToHarness(body),
+            maxTokens: Number(body.max_output_tokens ?? body.max_tokens ?? 8192),
+            ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
+            ...(Array.isArray(body.stop) ? { stop: body.stop } : {}),
+            ...(tools.length > 0 ? { tools } : {}),
+            sessionId: '',
+          }
+          const signal = new AbortController()
+          res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
+          const result = body.stream === true
+            ? await streamResponses(res, options, options.model, signal.signal)
+            : await completeResponses(res, options, options.model, signal.signal)
+          stats[result.ok ? 'ok' : 'failed'] += 1
+          stats.lastAt = now()
+          return
         }
         if (req.method === 'POST' && (routePath === '/v1/chat/completions' || routePath === '/chat/completions')) {
           const body = JSON.parse((await readBody(req)) || '{}')

@@ -34,6 +34,7 @@ try {
     gatewayPort: Schema.number().default(8330).description('本地网关端口'),
     accountPack: Schema.union(['auto', 'on', 'off']).default('auto').description('渠道包模式：auto 避让 ofm / on 独立反代 / off'),
     autoCheckin: Schema.boolean().default(false).description('WorkBuddy 每日自动签到'),
+    thinkingOffByDefault: Schema.boolean().default(false).description('调用方未指定思考强度时默认关思考（提升简单客户端兼容性）'),
     packGateway: Schema.boolean().default(false).description('渠道包自带 8326 网关（单网关策略下保持关闭）'),
   }).description('积分汇通')
 } catch {}
@@ -46,6 +47,7 @@ const SETTINGS_DEFAULTS = {
   gatewayPort: 8330,
   accountPack: 'auto',
   autoCheckin: false,
+  thinkingOffByDefault: false,
   // 单网关策略：8330 已通过 pack 桥接汇总全部模型，渠道包自带的 8326
   // 本地网关默认停用（进程级 env 硬开关，pack 的 RPC 也打不开）。
   packGateway: false,
@@ -54,7 +56,7 @@ const SETTINGS_DEFAULTS = {
 /** llm 是唯一硬依赖：没有它本插件无事可做，其余服务缺席只降级单个功能。 */
 export const inject = ['llm']
 
-const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs', 'packGateway']
+const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs', 'packGateway', 'thinkingOffByDefault']
 
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
