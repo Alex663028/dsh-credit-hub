@@ -1425,6 +1425,26 @@ window.__ModuleLoader__?.load({
     const apply = ctx => {
       window.__chApplyCount = (window.__chApplyCount ?? 0) + 1
       try {
+        // ① 插件详情页的设置页（plugins.item，view: 'page'）——DSH 插件设置
+        //    的标准挂载点：详情页 renderSlot('plugins.item', {view:'page'}, {only: 本插件 id})
+        ctx.slots.inject('plugins.item', () => {
+          const reg = ctx.slots.register({
+            name: 'plugins.item',
+            id: 'dsh-credit-hub',
+            order: 30,
+            label: () => t('nav'),
+            locale: NS,
+            inject: () => {},
+          }, function CreditHubPluginPage(props) {
+            if (props?.view === 'summary') {
+              return h('div', { className: 'ch-muted', style: { padding: '4px 0' } }, t('nav') + ' · ' + t('tab.overview') + ' / ' + t('tab.channels') + ' / ' + t('tab.upstreams') + ' / ' + t('tab.gateway'))
+            }
+            return h(SettingsPage, { ctx })
+          })
+          window.__chRegResult = String(reg).slice(0, 200)
+          return reg
+        })
+        // ② 应用级设置导航（settings.section）——可选挂载点
         ctx.slots.inject('settings.section', () => {
           const reg = ctx.slots.register({
             name: 'settings.section',
@@ -1432,6 +1452,7 @@ window.__ModuleLoader__?.load({
             order: 36,
             label: () => t('nav'),
             locale: NS,
+            inject: () => {},
           }, () => h(SettingsPage, { ctx }))
           window.__chRegResult = String(reg).slice(0, 200)
           return reg
