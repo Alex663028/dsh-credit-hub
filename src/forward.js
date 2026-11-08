@@ -59,7 +59,7 @@ export function saveApiKey(gatewayDir, key) {
 
 export function startGateway({ stores, hub, logger, settings }) {
   let apiKey = loadOrCreateApiKey(stores.gatewayDir)
-  let server = null
+  let servers = []
   let stats = { requests: 0, ok: 0, failed: 0, lastAt: 0 }
 
   const bind = () => `127.0.0.1:${currentPort()}`
@@ -425,9 +425,9 @@ export function startGateway({ stores, hub, logger, settings }) {
 
   // ── server ────────────────────────────────────────────────────────────────
   async function start() {
-    if (server) return bind()
+    if (servers.length > 0) return bind()
     const port = currentPort()
-    server = http.createServer(async (req, res) => {
+    const handler = async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const routePath = url.pathname.replace(/\/+$/, '') || '/'
       stats.requests += 1
@@ -490,26 +490,36 @@ export function startGateway({ stores, hub, logger, settings }) {
         if (!res.writableEnded) send(res, status, { error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error' } })
         stats.failed += 1
       }
-    })
-    await new Promise((resolve, reject) => {
+    }
+    // 双栈回环：只绑 127.0.0.1 时，把 base_url 写成 localhost 的 agent 会先解析
+    // 到 ::1 → ECONNREFUSED。IPv4/IPv6 两条 socket 可共用同一端口号。
+    const listenOn = (host, family) => new Promise((resolve, reject) => {
+      const server = http.createServer(handler)
       server.once('error', reject)
-      server.listen(port, '127.0.0.1', () => resolve())
+      server.listen(port, host, () => resolve(server))
     })
-    logger?.info?.(`credit-hub: 本地网关已监听 http://${bind()}/v1`)
+    const ipv4 = await listenOn('127.0.0.1', 4)
+    servers.push(ipv4)
+    try {
+      const ipv6 = await listenOn('::1', 6)
+      servers.push(ipv6)
+      logger?.info?.(`credit-hub: 本地网关已监听 http://127.0.0.1:${port}/v1 与 http://[::1]:${port}/v1`)
+    } catch (error) {
+      logger?.info?.(`credit-hub: 本地网关 IPv6(::1) 监听不可用（${error?.message ?? error}），仅 IPv4`)
+    }
     return bind()
   }
 
   async function stop() {
-    if (!server) return
-    const closing = server
-    server = null
-    await new Promise(resolve => closing.close(() => resolve()))
+    const closing = servers
+    servers = []
+    await Promise.all(closing.map(server => new Promise(resolve => server.close(() => resolve()))))
   }
 
   return {
     start,
     stop,
-    get running() { return server !== null },
+    get running() { return servers.length > 0 },
     key: () => apiKey,
     async setKey(newKey) {
       saveApiKey(stores.gatewayDir, newKey)
