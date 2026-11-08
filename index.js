@@ -110,7 +110,7 @@ export function apply(ctx, config = {}) {
     log({ scope: 'turn', message: `${model}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}` })
   }
   const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
-  const gateway = startGateway({ stores, hub, logger, settings })
+  const gateway = startGateway({ stores, hub, logger, settings, log })
 
   // ── 模型车道注册 ───────────────────────────────────────────────────────────
   let registration

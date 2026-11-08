@@ -62,7 +62,7 @@ export function saveApiKey(gatewayDir, key) {
   return key
 }
 
-export function startGateway({ stores, hub, logger, settings }) {
+export function startGateway({ stores, hub, logger, settings, log }) {
   let apiKey = loadOrCreateApiKey(stores.gatewayDir)
   let servers = []
   let stats = { requests: 0, ok: 0, failed: 0, lastAt: 0 }
@@ -653,9 +653,22 @@ export function startGateway({ stores, hub, logger, settings }) {
         return res.end()
       }
       res.setHeader('access-control-allow-origin', cors['access-control-allow-origin'])
+      let rawBody = ''
       try {
         if (routePath === '/healthz') return send(res, 200, { ok: true })
-        if (!authorized(req)) return send(res, 401, { error: { message: 'invalid gateway key', type: 'auth_error' } })
+        const keyOk = authorized(req)
+        if (!keyOk) {
+          // 401 也留痕：调用方 Key 配错是最高频的接入问题
+          log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配，key 头前 6 位: ${String(req.headers.authorization ?? req.headers['x-api-key'] ?? '').slice(0, 12)}）` })
+          return send(res, 401, { error: { message: 'invalid gateway key', type: 'auth_error' } })
+        }
+        if (req.method === 'POST' && routePath.startsWith('/v1/')) {
+          // 请求体预览落日志：调用方接入排查的第一现场
+          rawBody = await readBody(req)
+          let modelPreview = ''
+          try { modelPreview = String(JSON.parse(rawBody || '{}')?.model ?? '') } catch {}
+          log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} body=${rawBody.slice(0, 300)}` })
+        }
         if (req.method === 'GET' && routePath === '/v1/models') {
           const rows = await hub.catalog()
           return send(res, 200, {
@@ -664,7 +677,7 @@ export function startGateway({ stores, hub, logger, settings }) {
           })
         }
         if (req.method === 'POST' && (routePath === '/v1/responses' || routePath === '/responses')) {
-          const body = JSON.parse((await readBody(req)) || '{}')
+          const body = JSON.parse(rawBody || '{}')
           const tools = responsesToolsToHarness(body.tools)
           const options = {
             model: String(body.model ?? ''),
@@ -686,7 +699,7 @@ export function startGateway({ stores, hub, logger, settings }) {
           return
         }
         if (req.method === 'POST' && (routePath === '/v1/chat/completions' || routePath === '/chat/completions')) {
-          const body = JSON.parse((await readBody(req)) || '{}')
+          const body = JSON.parse(rawBody || '{}')
           const options = harnessOptions(body, openAiToHarness(body.messages), 'openai')
           const signal = new AbortController()
           // Abort on the *response* closing early — req 'close' also fires once
@@ -695,18 +708,20 @@ export function startGateway({ stores, hub, logger, settings }) {
           const result = body.stream === true
             ? await streamOpenAi(res, options, options.model, signal.signal)
             : await completeOpenAi(res, options, options.model, signal.signal)
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(result.error?.message ?? '').slice(0, 160)}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
         }
         if (req.method === 'POST' && (routePath === '/v1/messages' || routePath === '/messages')) {
-          const body = JSON.parse((await readBody(req)) || '{}')
+          const body = JSON.parse(rawBody || '{}')
           const options = harnessOptions(body, claudeToHarness(body), 'claude')
           const signal = new AbortController()
           res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
           const result = body.stream === true
             ? await streamClaude(res, options, options.model, signal.signal)
             : await completeClaude(res, options, options.model, signal.signal)
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(result.error?.message ?? '').slice(0, 160)}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
@@ -717,8 +732,11 @@ export function startGateway({ stores, hub, logger, settings }) {
           : error?.code === CODE.notFound ? 404
           : error?.code === CODE.auth ? 502
           : 500
+        // 异常堆栈进日志页（前 6 行）——定位第三方 agent 的崩溃现场
+        const stack = String(error?.stack ?? '').split('\n').slice(0, 6).join(' ⏎ ')
+        log?.({ scope: 'gateway', level: 'error', message: `${req.method} ${routePath} 500: ${error?.message ?? error} ｜ ${stack}` })
         logger?.warn?.(`credit-hub gateway: ${error?.message ?? error}`)
-        if (!res.writableEnded) send(res, status, { error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error' } })
+        if (!res.writableEnded) send(res, status, { error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error', stack: String(error?.stack ?? '').split('\n').slice(0, 6) } })
         stats.failed += 1
       }
     }
