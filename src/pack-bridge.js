@@ -169,14 +169,16 @@ export function createPackBridge({ logger, warn } = {}) {
       provider: route.provider,
       model: route.model,
       messages: chat,
-      ...(systemText !== '' ? { system: systemText } : {}),
+      // 适配器可能无条件读取这些字段的 .length（如 tools.length）——
+      // 缺省字段一律补齐宿主 GenerateOptions 的默认形状
+      system: systemText,
+      tools: Array.isArray(options?.tools) ? options.tools : [],
+      stop: Array.isArray(options?.stop) ? options.stop : [],
       ...(Number.isFinite(options?.maxTokens) ? { maxTokens: options.maxTokens } : {}),
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
-      ...(Array.isArray(options?.stop) && options.stop.length > 0 ? { stop: options.stop } : {}),
-      ...(Array.isArray(options?.tools) && options.tools.length > 0 ? { tools: options.tools } : {}),
       ...reasoningPatch,
       // 会话透传：渠道包适配器按 sessionId 做配额/会话记账，缺了会退化成共享会话
-      ...(typeof options?.sessionId === 'string' && options.sessionId !== '' ? { sessionId: options.sessionId } : {}),
+      sessionId: typeof options?.sessionId === 'string' ? options.sessionId : '',
       signal,
     }
     let outcome = { sawFinish: false, finish: undefined, usage: undefined }

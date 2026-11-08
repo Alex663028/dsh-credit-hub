@@ -541,8 +541,11 @@ export function startGateway({ stores, hub, logger, settings }) {
     let messageItemId = null
     let openTool = null
     let currentText = ''
+    let reasoningItemId = null
+    let reasoningText = ''
     const openMessage = () => {
       if (messageItemId !== null) return
+      closeReasoning()
       messageItemId = `msg_${Date.now().toString(36)}${outputIndex}`
       frame('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'message', role: 'assistant', id: messageItemId, content: [] } })
       frame('response.content_part.added', { type: 'response.content_part.added', item_id: messageItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } })
@@ -566,6 +569,15 @@ export function startGateway({ stores, hub, logger, settings }) {
       output.push({ type: 'function_call', id: callId, call_id: callId, name: block.name, arguments: block.arguments })
       outputIndex += 1
     }
+    const closeReasoning = () => {
+      if (reasoningItemId === null) return
+      frame('response.reasoning_summary_text.done', { type: 'response.reasoning_summary_text.done', item_id: reasoningItemId, summary_index: 0, text: reasoningText })
+      frame('response.output_item.done', { type: 'response.output_item.done', output_index: outputIndex, item: { type: 'reasoning', id: reasoningItemId, summary: [{ type: 'summary_text', text: reasoningText }] } })
+      output.push({ type: 'reasoning', id: reasoningItemId, summary: [{ type: 'summary_text', text: reasoningText }] })
+      outputIndex += 1
+      reasoningItemId = null
+      reasoningText = ''
+    }
     try {
       for await (const chunk of call.stream({ ...options, signal })) {
         if (signal.aborted) break
@@ -574,11 +586,18 @@ export function startGateway({ stores, hub, logger, settings }) {
           currentText += chunk.text
           frame('response.output_text.delta', { type: 'response.output_text.delta', item_id: messageItemId, output_index: outputIndex, content_index: 0, delta: chunk.text })
         } else if (chunk.type === 'reasoning-delta') {
-          // Codex 线：推理增量作为 reasoning summary delta 透传（客户端不渲染也无碍）
-          if (messageItemId === null) {
-            frame('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: 'rs', output_index: outputIndex, delta: chunk.text })
+          // Codex 线：推理增量挂在**已声明**的 reasoning item 上——
+          // 未声明就发 delta 会让按事件状态机处理的客户端崩在未知 item 上
+          if (reasoningItemId === null) {
+            closeMessage()
+            reasoningItemId = `rs_${Date.now().toString(36)}${outputIndex}`
+            frame('response.output_item.added', { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'reasoning', id: reasoningItemId, summary: [] } })
+            frame('response.reasoning_summary_part.added', { type: 'response.reasoning_summary_part.added', item_id: reasoningItemId, summary_index: 0, part: { type: 'summary_text', text: '' } })
           }
+          reasoningText += chunk.text
+          frame('response.reasoning_summary_text.delta', { type: 'response.reasoning_summary_text.delta', item_id: reasoningItemId, summary_index: 0, delta: chunk.text })
         } else if (chunk.type === 'block-end' && chunk.block?.type === 'tool-call') {
+          closeReasoning()
           emitToolCall(chunk.block)
         } else if (chunk.type === 'usage') {
           usage = chunk.usage
@@ -589,6 +608,7 @@ export function startGateway({ stores, hub, logger, settings }) {
           }
         }
       }
+      closeReasoning()
       closeMessage()
       if (failure !== null) {
         frame('response.failed', { type: 'response.failed', response: { id: responseId, object: 'response', status: 'failed', model, output, error: { message: String(failure.message ?? 'upstream error'), type: 'gateway_error' } } })
@@ -653,6 +673,7 @@ export function startGateway({ stores, hub, logger, settings }) {
             ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
             ...(Array.isArray(body.stop) ? { stop: body.stop } : {}),
             ...(tools.length > 0 ? { tools } : {}),
+            ...(body.reasoning?.effort !== undefined ? { reasoningEffort: body.reasoning.effort } : {}),
             sessionId: '',
           }
           const signal = new AbortController()
