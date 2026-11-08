@@ -431,6 +431,19 @@ export function startGateway({ stores, hub, logger, settings }) {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const routePath = url.pathname.replace(/\/+$/, '') || '/'
       stats.requests += 1
+      // 浏览器内运行的 agent（webview/页面形态）需要 CORS + 预检；桌面/CLI
+      // agent 不受影响。Key 鉴权仍然照常把关。
+      const cors = {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, POST, OPTIONS',
+        'access-control-allow-headers': 'authorization, content-type, anthropic-version, x-api-key, x-api-key-hash',
+        'access-control-max-age': '86400',
+      }
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, cors)
+        return res.end()
+      }
+      res.setHeader('access-control-allow-origin', cors['access-control-allow-origin'])
       try {
         if (routePath === '/healthz') return send(res, 200, { ok: true })
         if (!authorized(req)) return send(res, 401, { error: { message: 'invalid gateway key', type: 'auth_error' } })
