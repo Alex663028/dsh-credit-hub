@@ -328,7 +328,7 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
         { id: 'sn-plain', name: 'P' },
       ],
       resolveModelInfo: async (provider, model) => model === 'sn-reasoning'
-        ? { reasoning: { efforts: ['low', 'high'] } }
+        ? { reasoning: { efforts: [{ id: 'low' }, { name: 'high' }] } }
         : undefined,
       stream: async function * (generate) {
         genSeen.push(generate)
@@ -342,11 +342,12 @@ await testAsync('pack bridge lists host providers and forwards llm.stream', asyn
       options: { messages: [{ role: 'user', content: 'hi' }], ...(effort !== undefined ? { reasoningEffort: effort } : {}) },
       onChunk: () => {},
     })
-    await stream('sn-reasoning', 'max')   // max → 钳到 high
+    await stream('sn-reasoning', 'max')   // max → 钳到 high（菜单是对象条目，归一化后）
     await stream('sn-reasoning', 'low')   // low → 原样
     await stream('sn-plain', 'high')      // 无思考菜单 → 整个去掉
     await stream('sn-plain', undefined)   // 未指定 → 保持未指定
     assert.deepEqual(genSeen.map(g => g.reasoningEffort), ['high', 'low', undefined, undefined])
+    assert(genSeen.every(g => g.reasoningEffort === undefined || typeof g.reasoningEffort === 'string'), 'no object effort ever reaches the adapter')
     await rmDir(dir2)
   })
 

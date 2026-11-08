@@ -98,7 +98,8 @@ export function createPackBridge({ logger, warn } = {}) {
   // 模型思考档位缓存：pkId → { efforts, defaultEffort }（无菜单 = 不支持思考）
   const modelMeta = new Map()
 
-  /** 查宿主模型的思考档位菜单；查不到 = 无菜单（调用方 effort 应整个去掉）。 */
+  /** 查宿主模型的思考档位菜单；查不到 = 无菜单（调用方 effort 应整个去掉）。
+   *  菜单条目可能是对象（{id}/{name}/{level}）——一律归一化为字符串。 */
   async function resolveMeta(provider, model) {
     const key = `pk/${provider}/${model}`
     if (modelMeta.has(key)) return modelMeta.get(key)
@@ -106,8 +107,11 @@ export function createPackBridge({ logger, warn } = {}) {
     try {
       const info = await llm.resolveModelInfo?.(provider, model)
       const r = info?.reasoning
-      if (r && Array.isArray(r.efforts) && r.efforts.length > 0) {
-        meta = { efforts: r.efforts, defaultEffort: r.defaultEffort }
+      const efforts = (Array.isArray(r?.efforts) ? r.efforts : [])
+        .map(effort => typeof effort === 'string' ? effort : String(effort?.id ?? effort?.name ?? effort?.level ?? ''))
+        .filter(effort => effort !== '')
+      if (efforts.length > 0) {
+        meta = { efforts, defaultEffort: typeof r.defaultEffort === 'string' ? r.defaultEffort : efforts[efforts.length - 1] }
       }
     } catch {}
     modelMeta.set(key, meta)
@@ -118,13 +122,13 @@ export function createPackBridge({ logger, warn } = {}) {
 
   /** 请求档位钳制到模型受支持集合：不支持思考 → undefined（整个不发）。 */
   function clampEffort(requested, meta) {
-    const list = meta?.efforts
-    if (!Array.isArray(list) || list.length === 0) return undefined
+    const list = (meta?.efforts ?? []).map(effort => typeof effort === 'string' ? effort : String(effort?.id ?? effort?.name ?? '')).filter(effort => effort !== '')
+    if (list.length === 0) return undefined
     const requestedNorm = String(requested).toLowerCase()
     if (requestedNorm === 'off') return list.includes('off') ? 'off' : undefined
     if (list.includes(requestedNorm)) return requestedNorm
     const reqRank = EFFORT_RANK[requestedNorm] ?? 4
-    const below = list.filter(effort => (EFFORT_RANK[effort] ?? 4) <= reqRank)
+    const below = list.filter(effort => (EFFORT_RANK[effort.toLowerCase()] ?? 4) <= reqRank)
     return below.length > 0 ? below[below.length - 1] : list[0]
   }
 
