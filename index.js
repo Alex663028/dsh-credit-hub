@@ -72,6 +72,15 @@ export function apply(ctx, config = {}) {
   }
   let packStatus = { mounted: false, reason: 'pending' }
 
+  // 目录变更广播：模型开关/上游/链路改动后通知宿主刷新选择器缓存。
+  // 宿主把各 provider 的模型目录缓存在本地——不广播的话，WB 等汇通模型的
+  // 开关在选择器里永远不生效（渠道包自己的 setDisabled 会广播，无需代劳）。
+  // ⚠️ 必须在所有引用它的 runtime 创建之前定义（const 无提升）。
+  const broadcastCatalogChanged = () => {
+    try { ctx.llm?.emitAdaptersUpdated?.() } catch {}
+    try { ctx.emit?.('llm/adapters-updated') } catch {}
+  }
+
   // 渠道包 8326 网关的进程级硬开关：必须在 pack 挂载前设置。pack 挂载是
   // 异步的（ctx.inject 回调），这里同步先设，保证竞态安全。
   if (settings().packGateway === false) {
@@ -100,14 +109,6 @@ export function apply(ctx, config = {}) {
   }
   const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
   const gateway = startGateway({ stores, hub, logger, settings })
-
-  // 目录变更广播：模型开关/上游/链路改动后通知宿主刷新选择器缓存。
-  // 宿主把各 provider 的模型目录缓存在本地——不广播的话，WB 等汇通模型的
-  // 开关在选择器里永远不生效（渠道包自己的 setDisabled 会广播，无需代劳）。
-  const broadcastCatalogChanged = () => {
-    try { ctx.llm?.emitAdaptersUpdated?.() } catch {}
-    try { ctx.emit?.('llm/adapters-updated') } catch {}
-  }
 
   // ── 模型车道注册 ───────────────────────────────────────────────────────────
   let registration

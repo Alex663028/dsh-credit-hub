@@ -432,5 +432,38 @@ await testAsync('gateway e2e: openai/anthropic/combo/failover/usage-protocol/cus
   await rmDir(dir)
 })
 
+// ── apply() 启动冒烟：模拟宿主 ctx 跑一遍 apply 主体 ────────────────────────
+// 专抓加载期崩溃（TDZ / 未定义引用 / 装配顺序），这类错误 node --check 查不出
+await testAsync('apply() boots with a mock host ctx', async () => {
+  const dir = tmpDir('ch-apply-')
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = dir // 隔离真实 ~/.dsh
+  const { apply } = await import('../index.js')
+  const effects = []
+  const injected = []
+  const mockCtx = {
+    logger: { info: () => {}, warn: () => {} },
+    llm: { registerAdapter: () => () => {}, emitAdaptersUpdated: () => {}, stream: async function * () {} },
+    inject: (deps, cb) => injected.push({ deps, cb }),
+    effect: fn => effects.push(fn),
+    on: () => () => {},
+    emit: () => {},
+    get: () => undefined,
+  }
+  let threw = null
+  try { apply(mockCtx, {}) } catch (error) { threw = error }
+  assert.equal(threw, null, `apply() threw at load: ${threw}`)
+  assert(injected.some(row => row.deps.includes('webServer')), 'webServer api wired')
+  assert(injected.some(row => row.deps.includes('credentials')), 'account pack wired')
+  assert(effects.length >= 3, `lifecycle effects registered (${effects.length})`)
+  // 跑一遍 setup 拿 disposer，清理定时器/网关/stores
+  for (const fn of effects) {
+    try { const disposer = fn(); if (typeof disposer === 'function') await disposer() } catch {}
+  }
+  if (previousHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousHome
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 process.exitCode = failures === 0 ? 0 : 1
