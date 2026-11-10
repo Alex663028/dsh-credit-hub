@@ -14,6 +14,9 @@
  */
 
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { postJson, getJson, postSse, UpstreamError, CODE } from './http.js'
 import { createNormalizer } from './normalize.js'
 import { toChatMessages, toChatTools, repairWorkbuddyBody } from './wire.js'
@@ -35,6 +38,47 @@ const MODELS_UA = 'CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0'
 
 /** 降级告警去重：同一原因只报一次，避免每次拉目录都刷屏。 */
 const degradationWarned = new Set()
+
+/**
+ * 11128 诊断转储：把失败请求的**结构指纹**写到数据目录，用于比对不可复现的
+ * 渠道校验拦截。只记 role/键/长度等形状信息与正文前 120 字符，便于定位触发点；
+ * 文件写在 {DSH_HOME}/credit-hub/diag/ 下，同一 model 只保留最后一次。
+ */
+function dumpBodyShape(body, tag) {
+  try {
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+    const dir = path.join(home, 'credit-hub', 'diag')
+    fs.mkdirSync(dir, { recursive: true })
+    const brief = value => {
+      if (typeof value === 'string') return { len: value.length, head: value.slice(0, 120) }
+      if (Array.isArray(value)) return { len: value.length, kinds: [...new Set(value.map(v => v?.type ?? typeof v))] }
+      if (value && typeof value === 'object') return { keys: Object.keys(value) }
+      return value
+    }
+    const shape = {
+      at: new Date().toISOString(),
+      model: body.model,
+      topLevelKeys: Object.keys(body),
+      max_tokens: body.max_tokens,
+      stream: body.stream,
+      stream_options: body.stream_options,
+      thinking: body.thinking,
+      reasoning_effort: body.reasoning_effort,
+      tools: body.tools ? { count: body.tools.length, sample: body.tools.slice(0, 2) } : undefined,
+      messageCount: body.messages?.length ?? 0,
+      roles: body.messages?.map(m => m.role),
+      // 每条只留形状：role / content 类型 / tool_calls 数 / 是否有 reasoning
+      messages: body.messages?.map(m => ({
+        role: m.role,
+        content: brief(m.content),
+        tool_calls: m.tool_calls ? m.tool_calls.length : undefined,
+        tool_call_id: m.tool_call_id,
+        reasoning: m.reasoning_content !== undefined ? m.reasoning_content.length : undefined,
+      })),
+    }
+    fs.writeFileSync(path.join(dir, `11128-${tag.replace(/[^\w.-]+/g, '_')}.json`), JSON.stringify(shape, null, 2))
+  } catch {}
+}
 
 /**
  * 目录 id 是 `wb/<realm>/<model>`（见 listModels），而 streamTurn 早期接口
@@ -555,6 +599,7 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
                 hasStop: Array.isArray(body.stop) && body.stop.length > 0,
               }
               warn?.(`credit-hub: workbuddy ${realm} 被渠道校验拦截（11128/6021），同账号重试；请求元数据 ${JSON.stringify(meta)}`)
+              dumpBodyShape(body, `${realm}-${bare}`)
             }
             await new Promise(resolve => {
               const timer = setTimeout(resolve, 500 * refusals + Math.floor(Math.random() * 300))
