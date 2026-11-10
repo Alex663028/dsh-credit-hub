@@ -176,8 +176,9 @@ await testAsync('hub catalog + model toggle + combo failover + unknown fail-fast
 
   // 模型开关：禁用后从选择器隐藏，combo 成员仍可用
   stores.settings.update(s => ({ ...s, modelDisabled: { 'up/m1': true } }))
+  // 聚合目录去重：wb 走独立车道，只剩 combo（被禁用的 up/m1 也已隐藏）
   const listed = await hub.adapter.listModels('credit-hub')
-  assert.equal(listed.length, 2, 'disabled hidden from picker (combo + wb)')
+  assert.equal(listed.length, 1, 'aggregate lists only combo (wb has own provider)')
   const rows = await hub.catalog(true)
   assert.equal(rows.find(r => r.id === 'combo/fast').combo.length, 2, 'chain members survive disable')
 
@@ -197,6 +198,32 @@ await testAsync('hub catalog + model toggle + combo failover + unknown fail-fast
 })
 
 // ── 并发目录计算：共享同一次结果，绝不返回空清单（2026-11-10 回归） ─────────
+await testAsync('aggregate listModels dedups models reachable via native providers', async () => {
+  const dir = tmpDir('ch-dedup-')
+  const stores = createStores(dir)
+  const workbuddy = makeSource('wb')
+  const upstreams = makeSource('up')
+  const packBridge = {
+    listModels: async () => [{ id: 'pk/zcode/GLM', source: 'pack', provider: 'zcode', modelId: 'GLM', name: 'GLM' }],
+  }
+  const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger: console, warn: () => {} })
+  await hub.setCombos([{ name: 'c', strategy: 'fallback', chain: ['wb/m1', 'up/m1'] }])
+
+  const ids = (await hub.adapter.listModels('credit-hub')).map(m => m.id)
+  assert(!ids.includes('wb/m1'), 'workbuddy 走独立车道，不再重复列在聚合目录')
+  assert(!ids.includes('pk/zcode/GLM'), 'pack 模型在各自渠道分组，不再重复列在聚合目录')
+  assert(ids.includes('up/m1'), '自填上游保留（外部无等价入口）')
+  assert(ids.includes('combo/c'), '降级链保留（外部无等价入口）')
+
+  // resolveModel 不受去重影响：网关、降级链、/api/models 仍按完整目录解析
+  for (const id of ['wb/m1', 'up/m1', 'pk/zcode/GLM', 'combo/c']) {
+    const info = await hub.adapter.resolveModel('credit-hub', id)
+    assert.equal(info.id, id)
+  }
+  stores.dispose()
+  await rmDir(dir)
+})
+
 await testAsync('concurrent catalog calls share one computation instead of returning empty', async () => {
   const dir = tmpDir('ch-conc-')
   const stores = createStores(dir)

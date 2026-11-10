@@ -244,14 +244,22 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
 
     async listModels(provider) {
       const rows = await catalog()
-      // 不仅暴露给 credit-hub route，也让 DSH UI 能读到 workbuddy/qoder 等 provider
-      return rows.filter(entry => entry.disabled !== true).map(entry => ({
-        provider,
-        id: entry.id,
-        name: entry.name,
-        description: entry.description,
-        inputModalities: entry.vision === true ? ['text', 'image'] : ['text'],
-      }))
+      // 聚合路由只保留"没有独立 provider 可达"的模型，避免与各渠道分组重复：
+      // - workbuddy：已注册独立车道，选择器里有「WorkBuddy」分组
+      // - pack：模型来自渠道包/宿主各自注册的 provider（qoder/zcode/…），
+      //   选择器里已有对应分组
+      // 保留自填上游（up/*）与降级链（combo/*）——这两类在外部没有等价入口。
+      // resolveModel 不受此过滤影响：网关、降级链、/api/models 仍按完整目录。
+      return rows
+        .filter(entry => entry.disabled !== true)
+        .filter(entry => entry.source === 'upstream' || entry.source === 'combo')
+        .map(entry => ({
+          provider,
+          id: entry.id,
+          name: entry.name,
+          description: entry.description,
+          inputModalities: entry.vision === true ? ['text', 'image'] : ['text'],
+        }))
     },
 
     async resolveModel(provider, model) {
