@@ -27,8 +27,12 @@ if (files.length === 0) {
 }
 const file = path.join(diagDir, files.sort().at(-1))
 const base = JSON.parse(fs.readFileSync(file, 'utf8'))
+// 落盘的是**上游 body**，model 是裸 id（deepseek-v4.1-flash）；网关要目录 id。
+// 从文件名推断 realm，拼回 wb/<realm>/<model>。
+const realm = /^11128-body-([a-z]+)-/.exec(path.basename(file))?.[1] ?? 'cn'
+if (!String(base.model ?? '').startsWith('wb/')) base.model = `wb/${realm}/${base.model}`
 console.log(`载荷: ${file}`)
-console.log(`消息数: ${base.messages?.length ?? 0} | tools: ${base.tools?.length ?? 0} | max_tokens: ${base.max_tokens} | thinking: ${JSON.stringify(base.thinking)}`)
+console.log(`目录 id: ${base.model} | 消息数: ${base.messages?.length ?? 0} | tools: ${base.tools?.length ?? 0} | max_tokens: ${base.max_tokens} | thinking: ${JSON.stringify(base.thinking)}`)
 
 const send = async body => {
   const response = await fetch(endpoint, {

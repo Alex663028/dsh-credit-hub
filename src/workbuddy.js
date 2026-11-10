@@ -19,7 +19,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { postJson, getJson, postSse, UpstreamError, CODE } from './http.js'
 import { createNormalizer } from './normalize.js'
-import { toChatMessages, toChatTools, repairWorkbuddyBody, takePairingStats, takeVendorNeutralized } from './wire.js'
+import { toChatMessages, toChatTools, repairWorkbuddyBody, takePairingStats, takeVendorNeutralized, demoteSystemToUser } from './wire.js'
 import { mintId, now, clamp, sanitizeEfforts } from './util.js'
 
 const CHAT_BASE = { cn: 'https://copilot.tencent.com', global: 'https://www.workbuddy.ai' }
@@ -560,6 +560,8 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
     // 常常只有一个账号 → 上限 1 → 完全不重试，一次被拦整轮失败（2026-11-10）。
     // 这里给 channel-refused / busy 增加同账号退避重试（不消耗账号轮转次数）。
     let refusals = 0
+    // 是否已把 system 指令降级并入 user 消息（11128 兜底形态）
+    let demoted = false
     for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
       const account = candidates[(rotateCursor + attempt) % candidates.length]
       await ensureFresh(account)
@@ -597,9 +599,9 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
         lastError = error
         tried.push(`${account.label}:${verdict}${error?.retryAfterMs ? `(retry-after=${error.retryAfterMs}ms)` : ''}`)
         if (verdict === 'channel-refused' || verdict === 'busy' || verdict === 'content-blocked') {
-          // 渠道校验/繁忙：上游允许重发，同账号退避重试两次再放弃。
+          // 渠道校验/繁忙：上游允许重发，同账号退避重试。
           // content-blocked 是内容策略拦截，重发无意义，直接轮转下一账号。
-          if (verdict !== 'content-blocked' && refusals < 2) {
+          if (verdict !== 'content-blocked' && refusals < 3) {
             refusals += 1
             if (refusals === 1) {
               // 只记元数据：定位 11128 的可复现差异，不落用户消息内容
@@ -612,10 +614,21 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
                 hasStop: Array.isArray(body.stop) && body.stop.length > 0,
               }
               warn?.(`credit-hub: workbuddy ${realm} 被渠道校验拦截（11128/6021），同账号重试；请求元数据 ${JSON.stringify(meta)}`)
-              dumpBodyShape(body, `${realm}-${bare}`)
+              // 只对大负载落 body：小请求（标题生成等）会覆盖掉真正的诊断样本
+              if ((body.messages?.length ?? 0) > 100) dumpBodyShape(body, `${realm}-${bare}`)
+            }
+            // 第二轮重试起改用「system 降级为 user」形态：实测该渠道的校验只拦
+            // system 角色内容，同样指令放 user 里即可通过（2026-11-10）。
+            if (refusals >= 2 && !demoted) {
+              const demotedMessages = demoteSystemToUser(body.messages)
+              if (demotedMessages !== null) {
+                body.messages = demotedMessages
+                demoted = true
+                log?.(`credit-hub: workbuddy ${realm}/${bare} 11128 持续，改为把 system 指令并入首条 user 后重试（指令仍送达模型）`)
+              }
             }
             await new Promise(resolve => {
-              const timer = setTimeout(resolve, 500 * refusals + Math.floor(Math.random() * 300))
+              const timer = setTimeout(resolve, 400 * refusals + Math.floor(Math.random() * 300))
               timer.unref?.()
             })
             if (signal?.aborted) throw error
