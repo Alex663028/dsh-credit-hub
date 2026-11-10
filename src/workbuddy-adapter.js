@@ -51,6 +51,7 @@ export function createWorkbuddyAdapter({ workbuddy, hub, settings }) {
       const rows = await workbuddy.listModels()
       const entry = rows.find(row => row.modelId === model)
       if (!entry) throw new UpstreamError(`workbuddy 没有模型 "${model}"`, CODE.notFound)
+      // DSH 期望 LlmReasoningInfo.efforts 是 [{id, name}, ...] 对象数组，不是字符串数组
       const reasoning = sanitizeEfforts(entry.efforts, entry.defaultEffort)
       return {
         provider,
@@ -59,7 +60,12 @@ export function createWorkbuddyAdapter({ workbuddy, hub, settings }) {
         inputModalities: entry.vision === true ? ['text', 'image'] : ['text'],
         context: { contextWindow: finiteOr(entry.contextWindow, 128000) },
         defaultMaxTokens: Math.min(finiteOr(entry.maxOutput, 16384), 32768),
-        ...(reasoning !== undefined ? { reasoning } : {}),
+        ...(reasoning !== undefined ? {
+          reasoning: {
+            efforts: reasoning.efforts.map(effort => ({ id: effort, name: effort })),
+            defaultEffort: reasoning.defaultEffort,
+          },
+        } : {}),
       }
     },
 
