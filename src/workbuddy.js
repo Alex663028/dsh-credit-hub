@@ -49,6 +49,11 @@ function dumpBodyShape(body, tag) {
     const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
     const dir = path.join(home, 'credit-hub', 'diag')
     fs.mkdirSync(dir, { recursive: true })
+    // 诊断期：首次 11128 落一份**完整请求体**供二分定位触发点（同 tag 覆盖）。
+    // 正文含用户对话，仅写本机数据目录，定位完成后应删除并去掉本段。
+    try {
+      fs.writeFileSync(path.join(dir, `11128-body-${tag.replace(/[^\w.-]+/g, '_')}.json`), JSON.stringify(body))
+    } catch {}
     const brief = value => {
       if (typeof value === 'string') return { len: value.length, head: value.slice(0, 120) }
       if (Array.isArray(value)) return { len: value.length, kinds: [...new Set(value.map(v => v?.type ?? typeof v))] }
