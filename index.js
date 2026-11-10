@@ -20,6 +20,7 @@ import { startGateway } from './src/forward.js'
 import { createApiRoutes } from './src/api.js'
 import { mountAccountPack } from './src/pack-mount.js'
 import { createPackBridge } from './src/pack-bridge.js'
+import { createWorkbuddyAdapter } from './src/workbuddy-adapter.js'
 import { createRing, now } from './src/util.js'
 
 const require = createRequire(import.meta.url)
@@ -181,20 +182,30 @@ export function apply(ctx, config = {}) {
   const gateway = startGateway({ stores, hub, logger, settings, log })
 
   // ── 模型车道注册 ───────────────────────────────────────────────────────────
+  // 聚合路由 credit-hub 供管理面/网关/降级链使用。
   let registration
   try {
-    // 只注册 credit-hub route。曾把本 adapter 同时挂到 workbuddy/qoder/qodercn/...
-    // 等渠道包 provider 名上（9397277），结果 packBridge.listModels() 枚举宿主
-    // provider 时又回到本 adapter，形成 catalog → packBridge → llm.listModels
-    // → catalog 的自激递归；排除表里只有 'credit-hub'，挡不住这些新名字，
-    // 45s 缓存在计算结束前不生效，指数展开 1 分钟内撑爆 V8 堆（2026-11-10 OOM）。
-    // UI 按子 provider 分组应让宿主读 credit-hub route 的 catalog，不在此抢注。
     registration = ctx.llm.registerAdapter([ROUTE_MAIN], hub.adapter)
     logger.info?.(`credit-hub: 模型车道已注册（${ROUTE_MAIN}）`)
   } catch (error) {
     warn(`llm.registerAdapter 失败：${error?.message ?? error}`)
   }
   ctx.effect(() => () => { registration?.() }, 'credit-hub: adapter routes')
+
+  // WorkBuddy 独立 provider：DSH 模型选择器按 provider 分组展示（channel-pack
+  // 的 qoder/raccoon 都是独立 provider 才能进选择器），credit-hub 聚合路由
+  // 不保证出现在聊天框选择器里。单独注册 workbuddy 让「WorkBuddy」分组直接
+  // 可选；请求映射回 credit-hub 完整目录 id，复用统一流转。
+  // 安全：本 adapter 的 listModels 直接调 workbuddy.listModels()，不经过
+  // hub.catalog；packBridge 排除表已加 'workbuddy'，不会桥接成 pk/workbuddy/*。
+  let wbRegistration
+  try {
+    wbRegistration = ctx.llm.registerAdapter(['workbuddy'], createWorkbuddyAdapter({ workbuddy, hub, settings }))
+    logger.info?.('credit-hub: WorkBuddy 独立车道已注册（workbuddy）')
+  } catch (error) {
+    warn(`credit-hub: workbuddy 车道注册失败：${error?.message ?? error}`)
+  }
+  ctx.effect(() => () => { wbRegistration?.() }, 'credit-hub: workbuddy adapter route')
 
   // ── 管理面 REST ────────────────────────────────────────────────────────────
   ctx.inject(['webServer'], scoped => {

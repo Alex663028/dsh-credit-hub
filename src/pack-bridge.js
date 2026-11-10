@@ -26,6 +26,9 @@ import crypto from 'node:crypto'
 
 const EXCLUDED_PROVIDERS = new Set([
   'credit-hub',
+  // WorkBuddy 已注册为独立 provider（workbuddy 分组直接进模型选择器），
+  // 不再桥接成 pk/workbuddy/* 造成重复。
+  'workbuddy',
   'anthropic',
   'openai',
   'openai-responses',
