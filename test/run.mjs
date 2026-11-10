@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createNormalizer } from '../src/normalize.js'
-import { toChatMessages, toClaudeMessages, toChatTools, repairWorkbuddyBody, repairToolPairing } from '../src/wire.js'
+import { toChatMessages, toClaudeMessages, toChatTools, repairWorkbuddyBody, repairToolPairing, sanitizeWorkbuddySystemText } from '../src/wire.js'
 import { sanitizeEfforts, finiteOr } from '../src/util.js'
 import { createStores, mintKey } from '../src/store.js'
 import { createHubRuntime } from '../src/hub.js'
@@ -101,6 +101,28 @@ test('harness → claude messages with tool_result merge', () => {
   const user = out.messages.find(m => m.role === 'user')
   assert.equal(user.content[0].type, 'tool_result')
   assert.equal(user.content[1].type, 'text')
+})
+
+// ── 11128 第二根因：system 里的「DeepSeek Harness」被渠道校验拦截 ────────────
+test('sanitizeWorkbuddySystemText neutralizes vendor name in system only', () => {
+  const out = sanitizeWorkbuddySystemText([
+    { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness. Rules follow.' },
+    { role: 'user', content: 'I like DeepSeek Harness a lot' },
+    { role: 'assistant', content: 'DeepSeek Harness is nice' },
+    { role: 'system', content: 'deepseek harness lowercase variant' },
+    { role: 'system', content: [{ type: 'text', text: 'block form: DeepSeek Harness' }] },
+  ])
+  assert.equal(out.touched, 3, '三条 system 命中')
+  assert(!out.messages[0].content.includes('DeepSeek Harness'), 'system 被中和')
+  assert(out.messages[0].content.includes('the AI coding harness'))
+  assert.equal(out.messages[1].content, 'I like DeepSeek Harness a lot', 'user 正文不动')
+  assert.equal(out.messages[2].content, 'DeepSeek Harness is nice', 'assistant 正文不动')
+  assert(!out.messages[3].content.toLowerCase().includes('deepseek harness'), '大小写变体也中和')
+  assert.equal(out.messages[4].content[0].text, 'block form: the AI coding harness', '块格式也能中和')
+
+  const clean = sanitizeWorkbuddySystemText([{ role: 'system', content: 'You are a helpful assistant.' }])
+  assert.equal(clean.touched, 0)
+  assert.equal(clean.messages[0].content, 'You are a helpful assistant.')
 })
 
 test('workbuddy body repair', () => {

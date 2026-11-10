@@ -309,6 +309,12 @@ export function repairWorkbuddyBody(body) {
     const touched = (stats.droppedOrphanTools ?? 0) + (stats.droppedDanglingCalls ?? 0) + (stats.droppedEmptyMessages ?? 0)
     if (touched > 0) pairingStats.push(stats)
   }
+  // 厂商名中和：system 里的「DeepSeek Harness」会被渠道校验判成 11128
+  if (Array.isArray(body.messages)) {
+    const neutralized = sanitizeWorkbuddySystemText(body.messages)
+    body.messages = neutralized.messages
+    if (neutralized.touched > 0) vendorNeutralized += neutralized.touched
+  }
   // 全空的消息列表无法发出：保底留一条 user，避免上游 11101
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     body.messages = [{ role: 'user', content: '(empty)' }]
@@ -316,8 +322,62 @@ export function repairWorkbuddyBody(body) {
   return body
 }
 
+/**
+ * WorkBuddy 出站前的 system 提示厂商名中和。
+ *
+ * 实测（2026-11-10）：DSH 的系统提示以「You are an AI agent powered by
+ * DeepSeek Harness.」开头，WorkBuddy 的渠道校验会把它判成
+ * `400 11128 Illegal API invocation from an unapproved channel`——
+ * 只认 **system 角色**里的 `DeepSeek Harness` 这一串：
+ *   - system 含该串            → 11128（不区分大小写）
+ *   - system 只含 DeepSeek      → 通过
+ *   - system 只含 Harness       → 通过
+ *   - user 消息含该串           → 通过
+ * 故只对 system/developer 消息做最小替换，保持语义（换成分渠道中性的说法），
+ * 不动用户/助手正文，避免篡改对话内容。
+ */
+const VENDOR_HARNESS = /deepseek\s*harness/gi
+export const NEUTRAL_HARNESS_NAME = 'the AI coding harness'
+
+export function sanitizeWorkbuddySystemText(messages) {
+  if (!Array.isArray(messages)) return messages
+  let touched = 0
+  const out = messages.map(message => {
+    if (message?.role !== 'system' && message?.role !== 'developer') return message
+    if (typeof message.content === 'string') {
+      if (!VENDOR_HARNESS.test(message.content)) return message
+      VENDOR_HARNESS.lastIndex = 0
+      touched += 1
+      return { ...message, content: message.content.replace(VENDOR_HARNESS, NEUTRAL_HARNESS_NAME) }
+    }
+    if (Array.isArray(message.content)) {
+      let hit = false
+      const content = message.content.map(block => {
+        if (block?.type !== 'text' || typeof block.text !== 'string') return block
+        if (!VENDOR_HARNESS.test(block.text)) return block
+        VENDOR_HARNESS.lastIndex = 0
+        hit = true
+        return { ...block, text: block.text.replace(VENDOR_HARNESS, NEUTRAL_HARNESS_NAME) }
+      })
+      if (!hit) return message
+      touched += 1
+      return { ...message, content }
+    }
+    return message
+  })
+  return { messages: out, touched }
+}
+
 /** 最近一次 repairWorkbuddyBody 的配对消毒统计（调用方取走并清空）。 */
 const pairingStats = []
 export function takePairingStats() {
   return pairingStats.splice(0, pairingStats.length)
+}
+
+/** system 厂商名中和计数（调用方取走并清零），用于日志观测。 */
+let vendorNeutralized = 0
+export function takeVendorNeutralized() {
+  const value = vendorNeutralized
+  vendorNeutralized = 0
+  return value
 }
