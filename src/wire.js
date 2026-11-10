@@ -213,9 +213,82 @@ function safeJson(text) {
 }
 
 /**
+ * WorkBuddy 出站前的 tool_calls 配对消毒。
+ *
+ * OpenAI 兼容协议要求每个 `assistant.tool_calls[]` 后面必须跟匹配的
+ * `role:'tool'` 消息；会话历史被裁剪/压缩后常出现孤儿 tool_calls（只有调用、
+ * 没有结果），WorkBuddy 的渠道校验直接把这种请求判成
+ * `400 11128 Illegal API invocation from an unapproved channel`
+ * （2026-11-10 实测：孤儿必现失败、配对即通过）。
+ *
+ * 这里做三件事，全部保持语义可解释：
+ *  1. 丢弃没有匹配 assistant.tool_calls 的孤儿 `role:'tool'` 消息；
+ *  2. 从 assistant 消息里剔除没有对应 tool 结果的 tool_call；剔空且正文也为空
+ *     时整条消息丢弃（空的 assistant 消息同样非法）；
+ *  3. 剩余 tool 消息按出现顺序保留，紧跟其所属 assistant 之后。
+ *
+ * 返回新数组，不修改入参。`stats` 仅用于日志观测。
+ */
+export function repairToolPairing(messages, stats = {}) {
+  const list = Array.isArray(messages) ? messages : []
+  // 第一遍：把 assistant 声明过的 tool_call id 全部收集起来。
+  // 注意不能直接把所有 role:'tool' 的 id 当作"有结果"——那样的孤儿 tool 消息会
+  // 自证存在，两侧都过滤不掉（2026-11-10 自测抓到）。
+  const declared = new Set()
+  for (const message of list) {
+    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue
+    for (const call of message.tool_calls) {
+      const id = typeof call?.id === 'string' ? call.id : ''
+      if (id !== '') declared.add(id)
+    }
+  }
+  // 第二遍：只有"被声明过"的 tool 结果才算有效配对
+  const paired = new Set()
+  for (const message of list) {
+    if (message?.role !== 'tool') continue
+    const id = typeof message.tool_call_id === 'string' ? message.tool_call_id : ''
+    if (id !== '' && declared.has(id)) paired.add(id)
+  }
+  const out = []
+  let droppedTools = 0
+  let droppedCalls = 0
+  let droppedMessages = 0
+  for (const message of list) {
+    if (message?.role === 'tool') {
+      const id = typeof message.tool_call_id === 'string' ? message.tool_call_id : ''
+      if (id === '' || !paired.has(id)) { droppedTools += 1; continue }
+      out.push(message)
+      continue
+    }
+    if (message?.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const kept = message.tool_calls.filter(call => {
+        const id = typeof call?.id === 'string' ? call.id : ''
+        if (id !== '' && paired.has(id)) return true
+        droppedCalls += 1
+        return false
+      })
+      if (kept.length === message.tool_calls.length) { out.push(message); continue }
+      const hasText = typeof message.content === 'string' ? message.content.trim() !== ''
+        : Array.isArray(message.content) ? message.content.length > 0 : message.content !== null && message.content !== undefined
+      if (kept.length === 0 && !hasText) { droppedMessages += 1; continue }
+      const next = { ...message }
+      if (kept.length === 0) delete next.tool_calls
+      else next.tool_calls = kept
+      out.push(next)
+      continue
+    }
+    out.push(message)
+  }
+  stats.droppedOrphanTools = droppedTools
+  stats.droppedDanglingCalls = droppedCalls
+  stats.droppedEmptyMessages = droppedMessages
+  return out
+}
+
+/**
  * WorkBuddy 出站前的 body 修正（对齐 workbuddy2api 的 PrepareBodyOpt）：
  * tool_choice 必须是字符串、developer→system、max_completion_tokens→max_tokens、
- * 强制 stream + stream_options.include_usage。
+ * 强制 stream + stream_options.include_usage、tool_calls 配对消毒。
  */
 export function repairWorkbuddyBody(body) {
   if (typeof body.max_completion_tokens === 'number' && body.max_tokens === undefined) {
@@ -229,5 +302,22 @@ export function repairWorkbuddyBody(body) {
   if (body.tool_choice === 'none') body.tools = undefined
   body.stream = true
   if (body.stream_options === undefined) body.stream_options = { include_usage: true }
+  // 配对消毒：孤儿 tool_calls / 孤儿 tool 消息会让上游 11128（见函数注释）
+  if (Array.isArray(body.messages)) {
+    const stats = {}
+    body.messages = repairToolPairing(body.messages, stats)
+    const touched = (stats.droppedOrphanTools ?? 0) + (stats.droppedDanglingCalls ?? 0) + (stats.droppedEmptyMessages ?? 0)
+    if (touched > 0) pairingStats.push(stats)
+  }
+  // 全空的消息列表无法发出：保底留一条 user，避免上游 11101
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    body.messages = [{ role: 'user', content: '(empty)' }]
+  }
   return body
+}
+
+/** 最近一次 repairWorkbuddyBody 的配对消毒统计（调用方取走并清空）。 */
+const pairingStats = []
+export function takePairingStats() {
+  return pairingStats.splice(0, pairingStats.length)
 }

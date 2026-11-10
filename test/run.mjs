@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createNormalizer } from '../src/normalize.js'
-import { toChatMessages, toClaudeMessages, toChatTools, repairWorkbuddyBody } from '../src/wire.js'
+import { toChatMessages, toClaudeMessages, toChatTools, repairWorkbuddyBody, repairToolPairing } from '../src/wire.js'
 import { sanitizeEfforts, finiteOr } from '../src/util.js'
 import { createStores, mintKey } from '../src/store.js'
 import { createHubRuntime } from '../src/hub.js'
@@ -113,6 +113,61 @@ test('workbuddy body repair', () => {
   assert.equal(body.tool_choice, 'ls')
   assert.equal(body.stream, true)
   assert.deepEqual(body.stream_options, { include_usage: true })
+})
+
+// ── 11128 根因护栏：孤儿 tool_calls / 孤儿 tool 消息（2026-11-10） ───────────
+test('repairToolPairing drops dangling tool_calls and orphan tool messages', () => {
+  // A: 只有调用、没有结果 → 剔除 tool_calls；正文为空则整条丢弃
+  const a = repairToolPairing([
+    { role: 'system', content: 's' },
+    { role: 'user', content: 'u1' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'r', arguments: '{}' } }] },
+    { role: 'user', content: 'u2' },
+  ])
+  assert.equal(a.length, 3, '空 assistant 消息被丢弃')
+  assert(!a.some(m => m.tool_calls), '悬空 tool_call 被剔除')
+
+  // B: 完整配对 → 原样保留
+  const b = repairToolPairing([
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+  ])
+  assert.equal(b.length, 2)
+  assert.equal(b[0].tool_calls.length, 1)
+
+  // C: 混合 → 只留配对成功的那一个，正文保留
+  const c = repairToolPairing([
+    { role: 'assistant', content: 'text', tool_calls: [{ id: 'c1' }, { id: 'c2' }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+  ])
+  assert.equal(c[0].tool_calls.length, 1)
+  assert.equal(c[0].tool_calls[0].id, 'c1')
+  assert.equal(c[0].content, 'text')
+
+  // D: 孤儿 tool 消息（凭空出现的结果）→ 丢弃，且不会自证存在
+  const d = repairToolPairing([{ role: 'tool', tool_call_id: 'ghost', content: 'x' }, { role: 'user', content: 'u' }])
+  assert.equal(d.length, 1)
+  assert.equal(d[0].role, 'user')
+
+  // E: body 层 —— 清空后保底一条 user，内部字段不外泄
+  const body = repairWorkbuddyBody({ model: 'm', messages: [{ role: 'assistant', content: null, tool_calls: [{ id: 'x' }] }] })
+  assert.equal(body.messages.length, 1)
+  assert.equal(body.messages[0].role, 'user')
+  assert.equal(body.__pairing, undefined, '内部字段不得写进请求体')
+})
+
+test('repairToolPairing keeps long real-world histories sendable', () => {
+  // 复刻线上 552 条会话：432 条带 tool_calls，全部没有 tool 结果
+  const messages = [{ role: 'system', content: 's' }, { role: 'user', content: 'u' }]
+  for (let i = 0; i < 432; i += 1) {
+    messages.push({ role: 'assistant', content: null, tool_calls: [{ id: 'call_' + i }] })
+    messages.push({ role: 'user', content: 'next' })
+  }
+  const stats = {}
+  const out = repairToolPairing(messages, stats)
+  assert.equal(stats.droppedDanglingCalls, 432, '全部悬空调用被记录')
+  assert(!out.some(m => Array.isArray(m.tool_calls) && m.tool_calls.length > 0), '出站后不应残留 tool_calls')
+  assert(out.length >= 2, '仍保留可解释的对话骨架')
 })
 
 test('chat tools from both shapes', () => {

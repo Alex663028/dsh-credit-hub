@@ -19,7 +19,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { postJson, getJson, postSse, UpstreamError, CODE } from './http.js'
 import { createNormalizer } from './normalize.js'
-import { toChatMessages, toChatTools, repairWorkbuddyBody } from './wire.js'
+import { toChatMessages, toChatTools, repairWorkbuddyBody, takePairingStats } from './wire.js'
 import { mintId, now, clamp, sanitizeEfforts } from './util.js'
 
 const CHAT_BASE = { cn: 'https://copilot.tencent.com', global: 'https://www.workbuddy.ai' }
@@ -527,6 +527,10 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
       ...(Array.isArray(options.stop) && options.stop.length > 0 ? { stop: options.stop } : {}),
       ...(typeof options.temperature === 'number' ? { temperature: options.temperature } : {}),
     })
+    // 配对消毒有动作时记一行：孤儿 tool_calls 是 11128 的根因，留痕便于回溯
+    for (const stats of takePairingStats()) {
+      log?.(`credit-hub: workbuddy ${realm}/${bare} 出站前清理未配对工具调用 —— 孤儿 tool 消息 ${stats.droppedOrphanTools}、悬空 tool_call ${stats.droppedDanglingCalls}、空消息 ${stats.droppedEmptyMessages}`)
+    }
     const tools = toChatTools(options.tools)
     if (tools.length > 0) body.tools = tools
     if (entry.reasoning === true && options.reasoningEffort !== undefined) {
