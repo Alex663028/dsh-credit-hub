@@ -260,6 +260,9 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       // 未知模型 fail-fast：装作解析成功只会把错误推迟到上游请求之后
       if (!entry) throw new UpstreamError(`credit-hub 没有模型 "${model}"`, CODE.notFound)
       // 宿主校验一票否决整条 provider——所有来源的档位/数值都在出口再消毒一次。
+      // 注意形状：LlmModelReasoningInfo.efforts 是 [{id, name}, ...] 对象数组，
+      // 不是字符串数组；返回字符串数组会被宿主判为 INVALID_MODEL_REASONING，
+      // 整个分组从模型选择器消失（2026-11-10 实测报错）。
       const reasoning = sanitizeEfforts(entry.efforts, entry.defaultEffort)
       return {
         provider,
@@ -268,7 +271,12 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         inputModalities: entry.vision === true ? ['text', 'image'] : ['text'],
         context: { contextWindow: finiteOr(entry.contextWindow, 128000) },
         defaultMaxTokens: Math.min(finiteOr(entry.maxOutput, 16384), 32768),
-        ...(reasoning !== undefined ? { reasoning } : {}),
+        ...(reasoning !== undefined ? {
+          reasoning: {
+            efforts: reasoning.efforts.map(effort => ({ id: effort, name: effort })),
+            defaultEffort: reasoning.defaultEffort,
+          },
+        } : {}),
       }
     },
 
