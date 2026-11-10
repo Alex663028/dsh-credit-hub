@@ -498,6 +498,11 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
     if (candidates.length === 0) throw new UpstreamError('workbuddy 渠道没有可用账号（未登录或全部冷却/禁用）', CODE.auth)
     const tried = []
     let lastError
+    // 11128「Illegal API invocation from an unapproved channel」的 displayTips 明确
+    // 要求「重新发送」；但旧逻辑 attempt 上限 = min(3, candidates.length)，cn 池
+    // 常常只有一个账号 → 上限 1 → 完全不重试，一次被拦整轮失败（2026-11-10）。
+    // 这里给 channel-refused / busy 增加同账号退避重试（不消耗账号轮转次数）。
+    let refusals = 0
     for (let attempt = 0; attempt < Math.min(3, candidates.length); attempt += 1) {
       const account = candidates[(rotateCursor + attempt) % candidates.length]
       await ensureFresh(account)
@@ -534,7 +539,33 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
         const verdict = classify(status, error?.envelope, error?.message)
         lastError = error
         tried.push(`${account.label}:${verdict}${error?.retryAfterMs ? `(retry-after=${error.retryAfterMs}ms)` : ''}`)
-        if (verdict === 'channel-refused' || verdict === 'busy' || verdict === 'content-blocked') continue
+        if (verdict === 'channel-refused' || verdict === 'busy' || verdict === 'content-blocked') {
+          // 渠道校验/繁忙：上游允许重发，同账号退避重试两次再放弃。
+          // content-blocked 是内容策略拦截，重发无意义，直接轮转下一账号。
+          if (verdict !== 'content-blocked' && refusals < 2) {
+            refusals += 1
+            if (refusals === 1) {
+              // 只记元数据：定位 11128 的可复现差异，不落用户消息内容
+              const meta = {
+                realm, model: bare, messages: body.messages?.length ?? 0,
+                firstRole: body.messages?.[0]?.role ?? null,
+                max_tokens: body.max_tokens, tools: body.tools?.length ?? 0,
+                thinking: body.thinking, reasoning_effort: body.reasoning_effort,
+                hasTemperature: typeof body.temperature === 'number',
+                hasStop: Array.isArray(body.stop) && body.stop.length > 0,
+              }
+              warn?.(`credit-hub: workbuddy ${realm} 被渠道校验拦截（11128/6021），同账号重试；请求元数据 ${JSON.stringify(meta)}`)
+            }
+            await new Promise(resolve => {
+              const timer = setTimeout(resolve, 500 * refusals + Math.floor(Math.random() * 300))
+              timer.unref?.()
+            })
+            if (signal?.aborted) throw error
+            attempt -= 1 // 不消耗账号轮转次数：下一次循环仍是同一账号
+            continue
+          }
+          continue
+        }
         if (verdict === 'session-dead') {
           const ok = await refreshAccount(account).catch(() => false)
           if (ok) continue
