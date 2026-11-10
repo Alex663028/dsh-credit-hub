@@ -220,6 +220,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
 
     async listModels(provider) {
       const rows = await catalog()
+      // 不仅暴露给 credit-hub route，也让 DSH UI 能读到 workbuddy/qoder 等 provider
       return rows.filter(entry => entry.disabled !== true).map(entry => ({
         provider,
         id: entry.id,
