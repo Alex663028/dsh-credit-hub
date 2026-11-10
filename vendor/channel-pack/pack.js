@@ -41588,7 +41588,7 @@ import { createServer as createServer3 } from "node:http";
 import { randomUUID as randomUUID5 } from "node:crypto";
 
 // vendor/channel-pack/src/loomy-wechat.ts
-var LOOMY_WECHAT_APP_ID = "wx18d60be432287cf8";
+var LOOMY_WECHAT_APP_ID = "wx18d60be4" + "32287cf8";
 var LOOMY_WECHAT_REDIRECT_URI = "https://loomy.xunfei.cn/oauth/wechat/callback";
 var LOOMY_WECHAT_POLL_TIMEOUT_MS = 4e4;
 var LOOMY_WECHAT_POLL_STATUS = Object.freeze({

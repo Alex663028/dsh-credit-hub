@@ -196,6 +196,61 @@ await testAsync('hub catalog + model toggle + combo failover + unknown fail-fast
   await rmDir(dir)
 })
 
+// ── 并发目录计算：共享同一次结果，绝不返回空清单（2026-11-10 回归） ─────────
+await testAsync('concurrent catalog calls share one computation instead of returning empty', async () => {
+  const dir = tmpDir('ch-conc-')
+  const stores = createStores(dir)
+  let listCalls = 0
+  const slow = {
+    listModels: async () => {
+      listCalls += 1
+      await new Promise(resolve => setTimeout(resolve, 300))
+      return [{ id: 'wb/slow', source: 'workbuddy', name: 'Slow', contextWindow: 128000, maxOutput: 8192 }]
+    },
+    status: () => ({ accounts: 1, ok: 1 }),
+  }
+  const hub = createHubRuntime({ stores, workbuddy: slow, upstreams: makeSource('up'), logger: console, warn: () => {} })
+  // 5 路并发（模拟模型选择器 + 网关 /v1/models + 设置页同时拉目录）
+  const results = await Promise.all(Array.from({ length: 5 }, () => hub.catalog()))
+  assert.equal(listCalls, 1, '并发只应触发一次底层枚举')
+  for (const [i, rows] of results.entries()) {
+    assert(rows.length >= 1, `第 ${i} 路拿到空清单——宿主会把空目录缓存进选择器`)
+    assert(rows.some(r => r.id === 'wb/slow'))
+  }
+  stores.dispose()
+  await rmDir(dir)
+})
+
+// ── 自激递归兜底：重入不得拖垮调用方（134 OOM 回归护栏） ────────────────────
+await testAsync('reentrant catalog is capped by the wait budget and never deadlocks', async () => {
+  const dir = tmpDir('ch-reentry-')
+  const stores = createStores(dir)
+  let depth = 0
+  const hub = createHubRuntime({
+    stores,
+    workbuddy: {
+      // 模拟「宿主把本 adapter 也挂到 provider 上」：枚举时回头再调 catalog
+      listModels: async () => {
+        if (depth > 0) return []
+        depth += 1
+        await hub.catalog(true)
+        depth -= 1
+        return []
+      },
+      status: () => ({ accounts: 0, ok: 0 }),
+    },
+    upstreams: makeSource('up'),
+    logger: console,
+    warn: () => {},
+  })
+  const started = Date.now()
+  const rows = await hub.catalog(true)
+  assert(Array.isArray(rows), '重入路径必须返回数组而不是挂死')
+  assert(Date.now() - started < 6000, `重入在 6s 内返回（实际 ${Date.now() - started}ms）`)
+  stores.dispose()
+  await rmDir(dir)
+})
+
 // ── workbuddy 装配（无网络） ────────────────────────────────────────────────
 await testAsync('workbuddy runtime assembly (no network)', async () => {
   const dir = tmpDir('ch-wb-')

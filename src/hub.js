@@ -106,58 +106,82 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
   let catalogCache
   let catalogAt = 0
   let lastDegraded = -1
+  // 并发共享的同一次目录计算。宿主一次 catalog 要几秒（WorkBuddy /v3/config +
+  // 逐 provider listModels），期间模型选择器、8330 的 /v1/models、设置页 API
+  // 都会并发进来；旧写法直接返回空清单，宿主把空结果缓存进选择器，45s 内不
+  // 重算——表现为「对话框里根本没有积分汇通的模型」。
+  let catalogInflight = null
+  // 目录计算期间的重入闸门：catalog() 会经 packBridge 枚举宿主 llm 注册表。
+  // 一旦宿主把本 adapter 也挂到那些 provider 名上，就会形成
+  // catalog → packBridge → llm.listModels → catalog 的自激递归；45s 缓存
+  // 是在计算结束后才写入的，挡不住重入（2026-11-10 OOM，exit 134）。
+  // 自激与正常并发在这一层无法区分，故对 in-flight 的等待设 2s 上限：
+  // 正常并发等得到结果，真递归拿空清单返回，既不死锁也不指数展开。
+  const catalogPending = () => catalogInflight
 
   async function catalog(force = false) {
     if (!force && catalogCache && now() - catalogAt < 45_000) return catalogCache
-    const entries = []
-    let degraded = 0
-    try { entries.push(...await workbuddy.listModels()) } catch (error) {
-      degraded += 1
-      warn?.(`credit-hub: [来源 1/3 workbuddy] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+    const pending = catalogPending()
+    if (pending !== null) {
+      const settled = await Promise.race([
+        pending.then(rows => rows).catch(() => null),
+        new Promise(resolve => { const timer = setTimeout(() => resolve(null), 2000); timer.unref?.() }),
+      ])
+      return settled ?? catalogCache ?? []
     }
-    try { entries.push(...await upstreams.listModels()) } catch (error) {
-      degraded += 1
-      warn?.(`credit-hub: [来源 2/3 upstreams] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
-    }
-    if (packBridge) {
-      try { entries.push(...await packBridge.listModels()) } catch (error) {
+    const job = (async () => {
+      const entries = []
+      let degraded = 0
+      try { entries.push(...await workbuddy.listModels()) } catch (error) {
         degraded += 1
-        warn?.(`credit-hub: [来源 3/3 packBridge] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+        warn?.(`credit-hub: [来源 1/3 workbuddy] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
       }
-    } else if (packModels) {
-      try { entries.push(...await packModels()) } catch (error) {
+      try { entries.push(...await upstreams.listModels()) } catch (error) {
         degraded += 1
-        warn?.(`credit-hub: [来源 3/3 packModels] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+        warn?.(`credit-hub: [来源 2/3 upstreams] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
       }
-    }
-    // 降级数变化时汇总一条：目录少了一半模型时不再只靠用户自己发现
-    if (degraded !== lastDegraded) {
-      lastDegraded = degraded
-      if (degraded > 0) warn?.(`credit-hub: 本轮模型目录 ${degraded} 个来源降级（共 3 个来源）`)
-    }
-    const rows = [...entries]
-    for (const combo of combos()) {
-      if (!Array.isArray(combo.chain) || combo.chain.length === 0) continue
-      const members = combo.chain.map(id => entries.find(row => row.id === id)).filter(Boolean)
-      rows.push({
-        id: `combo/${combo.name}`,
-        source: 'combo',
-        name: combo.name,
-        combo: combo.chain,
-        strategy: combo.strategy === 'round-robin' ? 'round-robin' : 'fallback',
-        // 链路容量取成员实测元数据：上下文取最短板，输出取最大可分期值
-        contextWindow: members.length > 0 ? Math.min(...members.map(row => finiteOr(row.contextWindow, 128000))) : 128000,
-        maxOutput: members.length > 0 ? Math.max(...members.map(row => finiteOr(row.maxOutput, 8192))) : 16384,
-        description: `${combo.chain.length} 模型链：${combo.chain.join(' → ')}`,
-      })
-    }
-    // 用户级模型开关：disabled 模型仍保留在目录里（降级链成员不受影响），
-    // 只是从选择器与网关清单里隐藏。
-    const disabledMap = settings().modelDisabled ?? {}
-    for (const row of rows) row.disabled = disabledMap[row.id] === true
-    catalogCache = rows
-    catalogAt = now()
-    return rows
+      if (packBridge) {
+        try { entries.push(...await packBridge.listModels()) } catch (error) {
+          degraded += 1
+          warn?.(`credit-hub: [来源 3/3 packBridge] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+        }
+      } else if (packModels) {
+        try { entries.push(...await packModels()) } catch (error) {
+          degraded += 1
+          warn?.(`credit-hub: [来源 3/3 packModels] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+        }
+      }
+      // 降级数变化时汇总一条：目录少了一半模型时不再只靠用户自己发现
+      if (degraded !== lastDegraded) {
+        lastDegraded = degraded
+        if (degraded > 0) warn?.(`credit-hub: 本轮模型目录 ${degraded} 个来源降级（共 3 个来源）`)
+      }
+      const rows = [...entries]
+      for (const combo of combos()) {
+        if (!Array.isArray(combo.chain) || combo.chain.length === 0) continue
+        const members = combo.chain.map(id => entries.find(row => row.id === id)).filter(Boolean)
+        rows.push({
+          id: `combo/${combo.name}`,
+          source: 'combo',
+          name: combo.name,
+          combo: combo.chain,
+          strategy: combo.strategy === 'round-robin' ? 'round-robin' : 'fallback',
+          // 链路容量取成员实测元数据：上下文取最短板，输出取最大可分期值
+          contextWindow: members.length > 0 ? Math.min(...members.map(row => finiteOr(row.contextWindow, 128000))) : 128000,
+          maxOutput: members.length > 0 ? Math.max(...members.map(row => finiteOr(row.maxOutput, 8192))) : 16384,
+          description: `${combo.chain.length} 模型链：${combo.chain.join(' → ')}`,
+        })
+      }
+      // 用户级模型开关：disabled 模型仍保留在目录里（降级链成员不受影响），
+      // 只是从选择器与网关清单里隐藏。
+      const disabledMap = settings().modelDisabled ?? {}
+      for (const row of rows) row.disabled = disabledMap[row.id] === true
+      catalogCache = rows
+      catalogAt = now()
+      return rows
+    })().finally(() => { catalogInflight = null })
+    catalogInflight = job
+    return job
   }
 
   function invalidate() {

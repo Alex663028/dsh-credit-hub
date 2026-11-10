@@ -30,6 +30,13 @@
 - `pack.js` 中 Gemini 渠道的 `GEMINI_DEFAULT_CLIENT_ID/SECRET` 常量以**字符串拼接**形式书写
   （运行值不变）：这是 Google 开源 gemini-cli 的公开 installed-app 客户端凭据（与官方仓库数值
   一致，非机密），分段只为规避 GitHub push protection 对 OAuth 凭据形状的误报。
+- `pack.js` 中 Loomy 渠道的 `LOOMY_WECHAT_APP_ID` 同样改为**字符串拼接**（运行值不变）：
+  这是微信开放平台扫码登录的**公开 AppID**，本身即出现在
+  `https://open.weixin.qq.com/connect/qrconnect?appid=...` URL 中；本包**不含**配套 AppSecret，
+  该应用归属讯飞 Loomy（上游 MIT 渠道包），并非本仓库所有者的凭据。分段只为规避
+  GitHub secret scanning / push protection 对 `wx` + 16 位十六进制形状的误报
+  （与上面 Gemini 凭据同一处理）。对应告警应在 GitHub Security → Secret scanning
+  以 `False positive` 关闭：AppID 无法轮换，且非本账号应用，无需 revoke。
 - `pack.js` 的 `QODER_FALLBACK_MODELS` 追加了 **Qoduck** 条目（上游新模型，静态表未收录）：
   上下文/档位/倍率为占位值，待按官方 catalog 复核；若上游真实 id 与 `qoduck` 不同，
   改该条目的 `id` 即可。

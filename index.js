@@ -183,10 +183,14 @@ export function apply(ctx, config = {}) {
   // ── 模型车道注册 ───────────────────────────────────────────────────────────
   let registration
   try {
-    // 不仅注册到 credit-hub route，也让 DSH UI 能读到 workbuddy/qoder 等 provider 的 models
-    // 这样聊天框的模型选择器就能看到「积分汇通」分组下的所有模型
-    registration = ctx.llm.registerAdapter([ROUTE_MAIN, 'workbuddy', 'qoder', 'qodercn', 'trae', 'cline', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini', 'lobsterai'], hub.adapter)
-    logger.info?.(`credit-hub: 模型车道已注册（${[ROUTE_MAIN, 'workbuddy', 'qoder'].join(', ')}...）`)
+    // 只注册 credit-hub route。曾把本 adapter 同时挂到 workbuddy/qoder/qodercn/...
+    // 等渠道包 provider 名上（9397277），结果 packBridge.listModels() 枚举宿主
+    // provider 时又回到本 adapter，形成 catalog → packBridge → llm.listModels
+    // → catalog 的自激递归；排除表里只有 'credit-hub'，挡不住这些新名字，
+    // 45s 缓存在计算结束前不生效，指数展开 1 分钟内撑爆 V8 堆（2026-11-10 OOM）。
+    // UI 按子 provider 分组应让宿主读 credit-hub route 的 catalog，不在此抢注。
+    registration = ctx.llm.registerAdapter([ROUTE_MAIN], hub.adapter)
+    logger.info?.(`credit-hub: 模型车道已注册（${ROUTE_MAIN}）`)
   } catch (error) {
     warn(`llm.registerAdapter 失败：${error?.message ?? error}`)
   }
