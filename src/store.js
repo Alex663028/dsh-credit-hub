@@ -13,6 +13,20 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+
+/** Windows 下 Node 的 chmod 只影响只读位，必须显式收紧 ACL。每个文件只做一次，best-effort。 */
+const aclDone = new Set()
+function tightenWindowsAcl(file) {
+  if (process.platform !== 'win32' || aclDone.has(file)) return
+  aclDone.add(file)
+  try {
+    const principal = `${process.env.USERDOMAIN ?? '.'}\\${process.env.USERNAME ?? 'Users'}`
+    spawnSync('icacls', [file, '/inheritance:r', '/grant:r', `${principal}:(F)`], {
+      stdio: 'ignore', timeout: 2000, windowsHide: true,
+    })
+  } catch {}
+}
 
 export const DATA_DIR_NAME = 'credit-hub'
 
@@ -67,6 +81,7 @@ function jsonStore(file, { secret = false, defaults = null } = {}) {
       }
       fs.renameSync(temp, file)
       try { fs.chmodSync(file, mode) } catch {}
+      if (secret) tightenWindowsAcl(file)
       return cache
     },
     update(fn) {
@@ -94,6 +109,27 @@ export function createStores(home = dshHome()) {
     accounts,
     routes,
     gatewayDir,
+    /** 一次性数据格式迁移：schemaVersion + 清理旧版签到标记（布尔值 / 不带账号后缀）。 */
+    migrate() {
+      const current = settings.load()
+      let changed = false
+      if (!Number.isInteger(current.schemaVersion) || current.schemaVersion < 2) {
+        current.schemaVersion = 2
+        changed = true
+      }
+      const marks = current.checkinMarks
+      if (marks && typeof marks === 'object') {
+        for (const [key, value] of Object.entries(marks)) {
+          // 旧格式：全局日期键（无 :账号后缀）或布尔值，无法代表某账号已签到
+          if (!key.includes(':') || typeof value === 'boolean') {
+            delete marks[key]
+            changed = true
+          }
+        }
+      }
+      if (changed) settings.save()
+      return { changed, schemaVersion: 2 }
+    },
     dispose() {
       settings.dispose(); accounts.dispose(); routes.dispose()
     },

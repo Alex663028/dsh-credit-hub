@@ -92,25 +92,48 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     const value = Number(settings().chainSilenceMs)
     return Number.isFinite(value) && value >= 500 ? value : 25_000
   }
+  // 单模型回合看门狗：combo 有 chainSilenceMs，但 runSingle 以前是裸 await，
+  // 上游（实测 iamhc）建立连接后一个字都不吐就能把网关请求挂到客户端超时。
+  const singleSilenceMs = () => {
+    const value = Number(settings().singleSilenceMs)
+    return Number.isFinite(value) && value >= 500 ? value : 120_000
+  }
+  const singleTotalMs = () => {
+    const value = Number(settings().singleTurnMaxMs)
+    return Number.isFinite(value) && value >= 5000 ? value : 600_000
+  }
 
   let catalogCache
   let catalogAt = 0
+  let lastDegraded = -1
 
   async function catalog(force = false) {
     if (!force && catalogCache && now() - catalogAt < 45_000) return catalogCache
     const entries = []
+    let degraded = 0
     try { entries.push(...await workbuddy.listModels()) } catch (error) {
-      warn?.(`credit-hub: workbuddy 模型清单失败（${error?.message ?? error}）`)
+      degraded += 1
+      warn?.(`credit-hub: [来源 1/3 workbuddy] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
     }
     try { entries.push(...await upstreams.listModels()) } catch (error) {
-      warn?.(`credit-hub: 上游清单失败（${error?.message ?? error}）`)
+      degraded += 1
+      warn?.(`credit-hub: [来源 2/3 upstreams] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
     }
     if (packBridge) {
       try { entries.push(...await packBridge.listModels()) } catch (error) {
-        warn?.(`credit-hub: pack 桥接清单失败（${error?.message ?? error}）`)
+        degraded += 1
+        warn?.(`credit-hub: [来源 3/3 packBridge] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
       }
     } else if (packModels) {
-      try { entries.push(...await packModels()) } catch {}
+      try { entries.push(...await packModels()) } catch (error) {
+        degraded += 1
+        warn?.(`credit-hub: [来源 3/3 packModels] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
+      }
+    }
+    // 降级数变化时汇总一条：目录少了一半模型时不再只靠用户自己发现
+    if (degraded !== lastDegraded) {
+      lastDegraded = degraded
+      if (degraded > 0) warn?.(`credit-hub: 本轮模型目录 ${degraded} 个来源降级（共 3 个来源）`)
     }
     const rows = [...entries]
     for (const combo of combos()) {
@@ -359,22 +382,56 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         return
       }
       const startedAt = now()
-      const { channel, request } = runInto(entry, options, () => {}, options.signal)
+      // 自有 controller：静默/总时长到期时不仅要停止读取，还要 abort 上游请求；
+      // 外层 signal（客户端断开）仍照常透传。
+      const controller = new AbortController()
+      const onOuterAbort = () => controller.abort(options.signal?.reason)
+      if (options.signal?.aborted === true) controller.abort(options.signal?.reason)
+      else options.signal?.addEventListener('abort', onOuterAbort, { once: true })
+      const innerSignal = controller.signal
+      const { channel, request } = runInto(entry, { ...options, signal: innerSignal }, () => {}, innerSignal)
       let outcome
       let streamError
+      let timedOut = false
+      const silenceMs = singleSilenceMs()
+      const totalMs = singleTotalMs()
       try {
         const reader = channel.read()
         while (true) {
-          const row = await reader.next()
+          const remaining = totalMs - (now() - startedAt)
+          const totalLimited = remaining <= silenceMs
+          const waitMs = Math.max(1, Math.min(silenceMs, remaining))
+          const row = await Promise.race([
+            reader.next(),
+            new Promise(resolve => { const timer = setTimeout(() => resolve(SILENT), waitMs); timer.unref?.() }),
+          ])
+          if (row === SILENT) {
+            timedOut = true
+            controller.abort()
+            const message = totalLimited
+              ? `单模型回合超过 ${Math.round(totalMs / 1000)}s 上限，已中止`
+              : `上游 ${Math.round(silenceMs / 1000)}s 无任何输出，已中止`
+            streamError = Object.assign(new Error(message), { code: CODE.timeout })
+            break
+          }
           if (row.done === true) break
           const chunk = row.value
           if (chunk?.__outcome !== undefined) { outcome = chunk.__outcome; break }
           if (chunk?.__error !== undefined) { streamError = chunk.__error; break }
           yield chunk
         }
-        await request
+        if (timedOut) {
+          // 挂死的渠道可能不响应 abort：给 request 2s 上界，绝不无限等
+          try { reader.return?.() } catch {}
+          await Promise.race([
+            request.catch(() => {}),
+            new Promise(resolve => { const timer = setTimeout(resolve, 2000); timer.unref?.() }),
+          ])
+        } else await request
       } catch (error) {
         streamError = error
+      } finally {
+        options.signal?.removeEventListener('abort', onOuterAbort)
       }
       const failure = streamError ?? outcome?.__error
       if (failure !== undefined || outcome === undefined) {

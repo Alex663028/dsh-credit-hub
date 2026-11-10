@@ -33,18 +33,31 @@ ANTHROPIC_BASE_URL = http://127.0.0.1:8330
 POST /v1/messages
 ```
 
-仅绑定回环地址；Key 落 `{DSH_HOME}/credit-hub/gateway/api-key`（0600）。
+仅绑定回环地址；Key 落 `{DSH_HOME}/credit-hub/gateway/api-key`（0600 + Windows ACL 收紧）。
+
+**网关 Key 只走请求头**：`Authorization: Bearer <Key>` 或 `x-api-key`。`?key=<Key>` 默认关闭
+（Key 会留在 URL / 历史 / Referer），确需兼容旧客户端时在设置里开 `allowQueryKey`。
+管理面 `/api/credit-hub` 只接受回环 Host + 同源/回环 Origin，跨站与 DNS rebinding 一律 403；
+`/gateway` 同时返回 `keyFingerprint` 便于核对。若要更强的写保护，可设置 `adminKey`，
+之后所有非 GET 请求必须带 `x-credit-hub-admin: <adminKey>`（设置页本身不带该头，故默认关闭）。
 
 模型 id 前缀：`wb/`（WorkBuddy 原生）、`up/`（自填上游）、`pk/`（渠道包桥接）、`combo/`（降级链）。
 
 ## 数据与凭据
 
-- 数据目录：`{DSH_HOME}/credit-hub/`（settings.json / routes.json / accounts.json / gateway/ / channel-pack/）
-- WorkBuddy token 与上游 API Key 只写 `accounts.json`（0600 目录 + 0600 原子写），管理接口只回 `hasKey` 与指纹
-- channel-pack 状态隔离在 `{DSH_HOME}/credit-hub/channel-pack/`
+- 数据目录：`{DSH_HOME}/credit-hub/`（settings.json / routes.json / accounts.json / usage.json / gateway/ / channel-pack/ / logs.jsonl）
+- WorkBuddy token 与上游 API Key 只写 `accounts.json`（0600 原子写 + fsync），管理接口只回 `hasKey` 与指纹
+- **Windows ACL**：Node 的 0600 在 Windows 只影响只读位，所以首次写凭据文件时会 best-effort 调 `icacls`
+  去掉继承并只授权当前用户；失败不影响写入。也可手动执行
+  `icacls "<文件>" /inheritance:r /grant:r "$env:USERDOMAIN\$env:USERNAME:(F)"`
+- **日志脱敏**：网关只记 method / 模型 / 字节数 / 消息条数，**不记请求体**；历史日志读出一律把
+  `body=...` 替换为 `[redacted]`。超过 1MB 轮换成 `.old` 并清掉上一份，不会无限堆积。
+  逐模型用量 `usage.json` 节流落盘，进程重启不再清零。
+- channel-pack 状态隔离在 `{DSH_HOME}/credit-hub/channel-pack/`。旧版因 pack 内部又拼一层，文件实际落在
+  `channel-pack/channel-pack/`；**v0.2.1 起读写同时兼容两层路径，既有账号/积分数据无需迁移**。
 - **平台差异**：0600/0700 权限位只在 POSIX 生效；Windows 下 Node 的 mode 仅影响只读位，
   凭据文件实际以用户 profile 目录的 ACL 保护。如需系统级凭据托管，后续可接入宿主
-  `dsh-credentials` 服务（已在 peerDependencies 声明）
+  `dsh-credentials` 服务（已在 peerDependencies 声明，全部标记为 optional）
 
 ## 安装
 
@@ -59,6 +72,11 @@ git clone https://github.com/Alex663028/dsh-credit-hub.git
 ```
 
 并把 `"dsh-credit-hub"` 加入 `dsh.profile.bundles`，然后重启 DSH。设置 → 积分汇通。
+
+> `link:` 便于改源码即时生效；pnpm 会提示「linked in dependency will not resolve peer dependencies」——
+> 这是 `link:` 的固有行为，插件运行态只依赖宿主 `ctx` 提供的服务，`@deepseek-ai/schemastery` 缺失时
+> 配置面板降级并打印一条明确告警，不影响网关与模型车道。**发布到插件市场时建议改用 `file:` 协议**。
+> `client.js` 有 IIFE + 幂等守卫，宿主重复注入也只会注册一次，不需重启 DSH。
 
 ## 使用声明（必读）
 

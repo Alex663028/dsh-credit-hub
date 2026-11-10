@@ -39,7 +39,10 @@ try {
     thinkingOffByDefault: Schema.boolean().default(false).description('调用方未指定思考强度时默认关思考（提升简单客户端兼容性）'),
     packGateway: Schema.boolean().default(false).description('渠道包自带 8326 网关（单网关策略下保持关闭）'),
   }).description('积分汇通')
-} catch {}
+} catch (error) {
+  // 旧版静默吞掉：link: 协议下 peerDeps 不解析时完全无感，配置面板降级不明不白
+  console.warn?.(`credit-hub: @deepseek-ai/schemastery 不可用，宿主配置面板降级（运行态不受影响）：${error?.message ?? error}`)
+}
 
 export const name = 'credit-hub'
 
@@ -58,11 +61,13 @@ const SETTINGS_DEFAULTS = {
 /** llm 是唯一硬依赖：没有它本插件无事可做，其余服务缺席只降级单个功能。 */
 export const inject = ['llm']
 
-const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs', 'packGateway', 'thinkingOffByDefault']
+const SETTINGS_KEYS = ['enabled', 'gatewayEnabled', 'gatewayPort', 'accountPack', 'defaultMaxTokens', 'autoCheckin', 'onboardingSeen', 'modelDisabled', 'chainSilenceMs', 'singleSilenceMs', 'singleTurnMaxMs', 'packGateway', 'thinkingOffByDefault', 'schemaVersion', 'allowQueryKey', 'adminKey']
 
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
   const stores = createStores()
+  // 数据格式迁移只跑一次：老版本的 checkinMarks 布尔键、缺失的 schemaVersion
+  stores.migrate?.()
   // 分层配置：DEFAULTS < 宿主 config（profile patch）< settings.json。
   // settings.json 是设置页写入的**稀疏覆盖层**——首次启动不预写全量键，
   // 用户没在设置页改过的键，宿主配置面板的改动就真实生效。
@@ -71,16 +76,32 @@ export function apply(ctx, config = {}) {
   const logRing = createRing(400)
   // 落盘日志：JSONL 追加写（异步、失败静默），供离线排查——超过 1MB 轮换成 .old
   const logFile = path.join(stores.dir, 'logs.jsonl')
+  const oldLogFile = `${logFile}.old`
+  let logWriteWarned = false
   const appendLog = row => {
     try {
       if (fs.existsSync(logFile) && fs.statSync(logFile).size > 1024 * 1024) {
-        fs.renameSync(logFile, `${logFile}.old`)
+        // 轮换前清掉上一份 .old，避免无限堆积；写失败只告警一次，不刷屏
+        try { fs.rmSync(oldLogFile, { force: true }) } catch {}
+        fs.renameSync(logFile, oldLogFile)
       }
       fs.appendFileSync(logFile, JSON.stringify(row) + '\n')
-    } catch {}
+    } catch (error) {
+      if (!logWriteWarned) {
+        logWriteWarned = true
+        logger.warn?.(`credit-hub: 运行日志写入失败（后续不再重复告警）：${error?.message ?? error}`)
+      }
+    }
   }
   const log = row => {
-    const full = { at: now(), level: 'info', ...row }
+    // 兼容历史调用方误传字符串（旧版会把字符串展开成逐字符畸形日志）
+    const input = typeof row === 'string' ? { message: row }
+      : (row && typeof row === 'object' ? row : { message: String(row) })
+    const full = { at: now(), level: 'info', ...input }
+    // 兜底脱敏：任何调用方再把请求体拼进 message 都在这里截掉
+    if (typeof full.message === 'string') {
+      full.message = full.message.replace(/body=[^\n]{0,2000}/g, 'body=[redacted]').slice(0, 2000)
+    }
     logRing.push(full)
     appendLog(full)
   }
@@ -103,9 +124,13 @@ export function apply(ctx, config = {}) {
 
   // 渠道包 8326 网关的进程级硬开关：必须在 pack 挂载前设置。pack 挂载是
   // 异步的（ctx.inject 回调），这里同步先设，保证竞态安全。
-  if (settings().packGateway === false) {
+  // 默认必须显式关掉 8326：旧版只在 `=== false` 时设置，配置层一旦被覆盖
+  // 就变成隐式默认开启，两个网关抢端口会把 host 带崩。
+  if (settings().packGateway !== true) {
     process.env.DSH_OPENAI_GATEWAY_ENABLED = '0'
     logger.info?.('credit-hub: 渠道包 8326 本地网关已按单网关策略停用（settings.packGateway）')
+  } else {
+    delete process.env.DSH_OPENAI_GATEWAY_ENABLED
   }
 
   const workbuddy = createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged: broadcastCatalogChanged })
@@ -114,8 +139,32 @@ export function apply(ctx, config = {}) {
   // 以 `pk/<provider>/<model>` 并入目录；请求走 ctx.llm.stream 进程内转发。
   const packBridge = createPackBridge({ logger, warn })
   packBridge.setLlm(ctx.llm)
-  // 逐模型用量（内存聚合，随进程生命周期）：模型 → {ok, failed, skipped, lastAt, tokens}
+  // 逐模型用量：内存聚合 + 节流落盘（旧版进程重启即清零）
+  let disposed = false
+  const usageFile = path.join(stores.dir, 'usage.json')
   const usageStats = new Map()
+  try {
+    const saved = JSON.parse(fs.readFileSync(usageFile, 'utf8'))
+    for (const [model, row] of Object.entries(saved?.models ?? {})) {
+      if (row && typeof row === 'object') {
+        usageStats.set(model, { ok: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, lastAt: 0, ...row })
+      }
+    }
+  } catch {}
+  let usageFlushTimer = null
+  const flushUsage = () => {
+    if (usageFlushTimer) { clearTimeout(usageFlushTimer); usageFlushTimer = null }
+    try {
+      const temp = `${usageFile}.${process.pid}.tmp`
+      fs.writeFileSync(temp, JSON.stringify({ at: now(), models: Object.fromEntries(usageStats) }, null, 2))
+      fs.renameSync(temp, usageFile)
+    } catch {}
+  }
+  const scheduleUsageFlush = () => {
+    if (usageFlushTimer || disposed) return
+    usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage() }, 5000)
+    usageFlushTimer.unref?.()
+  }
   const recordTurn = ({ model, ok, skipped, usage }) => {
     const row = usageStats.get(model) ?? { ok: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, lastAt: 0 }
     if (ok === true) row.ok += 1
@@ -125,6 +174,7 @@ export function apply(ctx, config = {}) {
     row.outputTokens += usage?.outputTokens ?? 0
     row.lastAt = now()
     usageStats.set(model, row)
+    scheduleUsageFlush()
     log({ scope: 'turn', message: `${model}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}` })
   }
   const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
@@ -164,12 +214,22 @@ export function apply(ctx, config = {}) {
   }, 'credit-hub: gateway boot')
 
   // ── vendored account-pack（Raccoon/Qoder/ZCode/MiniMax/…） ────────────────
+  // 挂载链必须有 catch + dispose：未处理的 rejection 会带崩 host；卸载时不清理
+  // 会在下一轮 apply 里重复注册 RPC/路由/8326 端口。
+  let packDispose = null
   ctx.inject(['credentials', 'commands', 'llm'], scoped => {
-    void mountAccountPack(scoped, { settings, stores, logger, warn }).then(status => { packStatus = status })
+    void mountAccountPack(scoped, { settings, stores, logger, warn })
+      .then(status => {
+        packStatus = status
+        const dispose = typeof status?.dispose === 'function' ? status.dispose : null
+        if (disposed) { try { dispose?.() } catch {} } else packDispose = dispose
+      })
+      .catch(error => warn(`credit-hub: account pack 挂载链异常：${error?.message ?? error}`))
   })
 
-  // ── 周期任务：token 刷新 + 可选每日签到 ────────────────────────────────────
+  // ── 周期任务：token 刷新 + 可选每日签到 + 模型目录广播 ────────────────────
   const tick = async () => {
+    if (disposed) return
     try {
       await workbuddy.tick()
       const current = settings()
@@ -204,18 +264,29 @@ export function apply(ctx, config = {}) {
       if (pending) {
         stores.settings.update(current => ({ ...current, checkinMarks: marks }))
       }
+      // 每 5 分钟广播一次模型目录变化，确保 DSH UI 能刷到新的 hub catalog
+      if (ctx.llm?.emitAdaptersUpdated) {
+        ctx.llm.emitAdaptersUpdated()
+      }
     } catch (error) {
       warn(`周期任务失败：${error?.message ?? error}`)
     }
   }
   const timer = setInterval(() => { void tick() }, 30 * 60_000)
   timer.unref?.()
-  setTimeout(() => { void tick() }, 20_000).unref?.()
+  // 句柄必须保存并在 dispose 清理：旧版卸载后 20s 仍会跑一次 tick
+  const startTimer = setTimeout(() => { void tick() }, 20_000)
+  startTimer.unref?.()
 
   // ── 清理 ──────────────────────────────────────────────────────────────────
   ctx.effect(() => () => {
+    disposed = true
     clearInterval(timer)
-    void gateway.stop().catch(() => {})
+    clearTimeout(startTimer)
+    flushUsage()
+    try { packDispose?.() } catch (error) { warn(`credit-hub: account pack 卸载失败：${error?.message ?? error}`) }
+    packDispose = null
+    void gateway.stop().catch(error => warn(`credit-hub: 网关关闭失败：${error?.message ?? error}`))
     stores.dispose()
   }, 'credit-hub: dispose')
 }

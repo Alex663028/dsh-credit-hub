@@ -13,11 +13,30 @@
  * @module client.js
  */
 
-window.__ModuleLoader__?.load({
+/**
+ * 注册包装：作用域隔离 + 幂等 + 有限重试
+ *
+ *  - 整段放进 IIFE，宿主重复注入时不会因顶层 `const` 重复声明而抛
+ *    `Identifier ... has already been declared`（历史上的 NS 冲突 ×4）；
+ *  - __DSH_CREDIT_HUB_CLIENT_V1__ 一旦置位，后续注入直接 return，
+ *    既挡重复注册，也挡重复排队重试定时器；
+ *  - ModuleLoader 暂不可用时不静默跳过：先 console.error 一次，再用
+ *    setTimeout(200ms) 有限重试（最多 10 次），就绪后再注册；耗尽仍
+ *    未就绪则给出明确告警并放弃，不无限循环、不并发重复注册。
+ */
+;(function registerCreditHubClient() {
+  'use strict'
+  const FLAG = '__DSH_CREDIT_HUB_CLIENT_V1__'
+  const MAX_RETRY = 10
+  const RETRY_MS = 200
+
+  if (window[FLAG]) return
+  window[FLAG] = true
+
+  const descriptor = {
   id: 'dsh-credit-hub',
   factory: require => {
     const React = require('react')
-    const NS = 'settings.creditHub'
     const DICT = {
   zh: {
     nav: '积分汇通',
@@ -1442,7 +1461,10 @@ window.__ModuleLoader__?.load({
       }
     }
 
+    let applied = false
     const apply = ctx => {
+      if (applied) return          // 幂等：重复 apply 不重复注册槽位
+      applied = true
       // ① 设置页主入口：「设置 → 积分汇通」（settings.section，list 槽）
       mount(ctx, 'settings.section', {
         id: 'credit-hub',
@@ -1484,4 +1506,29 @@ window.__ModuleLoader__?.load({
 
     return { apply, inject: ['slots', 'locale'], name: 'credit-hub', __renderTest }
   },
-})
+  }
+
+  let retries = 0
+  const attempt = () => {
+    const loader = window.__ModuleLoader__
+    if (loader && typeof loader.load === 'function') {
+      try {
+        loader.load(descriptor)
+      } catch (error) {
+        console.error(`[credit-hub] ModuleLoader.load 抛错，撤销幂等标记以便后续注入重试：${error?.message ?? error}`)
+        delete window[FLAG]
+      }
+      return
+    }
+    retries += 1
+    if (retries === 1) console.error('[credit-hub] window.__ModuleLoader__ 不可用，将在有限次数内重试注册')
+    if (retries > MAX_RETRY) {
+      console.error(`[credit-hub] __ModuleLoader__ 在 ${MAX_RETRY} 次重试（每次 ${RETRY_MS}ms）后仍不可用，放弃本轮注册：factory 未执行、设置页入口不会出现`)
+      // 撤销标记：宿主可能在更晚才把 ModuleLoader 挂上，后续注入要能重新排队重试
+      delete window[FLAG]
+      return
+    }
+    setTimeout(attempt, RETRY_MS)
+  }
+  attempt()
+})()

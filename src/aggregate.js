@@ -14,6 +14,9 @@ import { createNormalizer } from './normalize.js'
 import { toChatMessages, toClaudeMessages, toChatTools, toClaudeTools } from './wire.js'
 import { mintId, now, clamp } from './util.js'
 
+/** thinking budget 降级告警去重（同一上游 + 同一组合只报一次）。 */
+const budgetWarned = new Set()
+
 /** 填 Key 预设。baseURL 一律带到版本段（…/v1）。models 留空则靠“发现模型”。 */
 export const BUILTIN_PRESETS = [
   { id: 'deepseek', name: 'DeepSeek 开放平台', baseURL: 'https://api.deepseek.com/v1', kind: 'openai-chat',
@@ -213,7 +216,16 @@ export function createUpstreamRuntime({ stores, log }) {
         const budgets = { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32768, max: 65536 }
         const requested = budgets[String(options.reasoningEffort)] ?? 8192
         const budget = Math.min(requested, maxTokens - 1024)
-        if (budget >= 1024) body.thinking = { type: 'enabled', budget_tokens: budget }
+        if (budget >= 1024) {
+          body.thinking = { type: 'enabled', budget_tokens: budget }
+        } else {
+          // 旧版静默关闭思考：调用方以为开了 thinking，实际没有，且日志里查不到
+          const reason = `${entry.id ?? bare}:${requested}:${maxTokens}`
+          if (!budgetWarned.has(reason)) {
+            budgetWarned.add(reason)
+            log?.({ scope: 'upstream', level: 'warn', message: `credit-hub: ${entry.name} thinking budget ${requested} 装不下 max_tokens=${maxTokens}，本次不启用扩展思考` })
+          }
+        }
       }
       const tools = toClaudeTools(options.tools)
       if (tools.length > 0) body.tools = tools
@@ -232,17 +244,35 @@ export function createUpstreamRuntime({ stores, log }) {
         body.reasoning_effort = String(options.reasoningEffort)
       }
     }
-    const normalizer = createNormalizer(wire, onChunk)
-    try {
-      await postSse(`${entry.baseURL}${wire === 'anthropic-messages' ? '/messages' : '/chat/completions'}`, {
-        headers: headersOf(entry),
-        body,
-        signal,
-        onEvent: data => normalizer.feed(data),
-      })
-    } catch (error) {
-      try { normalizer.flushTails() } catch {}
-      throw error
+    const url = `${entry.baseURL}${wire === 'anthropic-messages' ? '/messages' : '/chat/completions'}`
+    // 429 有限重试（最多 2 次）。重试前重建 normalizer，且只有上游一个事件都没吐过
+    // 才允许重试 —— 否则重放会让客户端收到重复文本。
+    let normalizer = createNormalizer(wire, onChunk)
+    let sawEvent = false
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (signal?.aborted) throw new UpstreamError('request aborted', CODE.transport)
+      try {
+        await postSse(url, {
+          headers: headersOf(entry),
+          body,
+          signal,
+          onEvent: data => { sawEvent = true; normalizer.feed(data) },
+        })
+        break
+      } catch (error) {
+        try { normalizer.flushTails() } catch {}
+        const rateLimited = error?.rateLimited === true || Number(error?.status) === 429
+        if (!rateLimited || sawEvent || attempt === 2 || signal?.aborted) throw error
+        const wait = Math.min(Math.max(Number(error?.retryAfterMs) || (attempt === 0 ? 500 : 1500), 0), 30_000)
+        log?.({ scope: 'upstream', level: 'warn', message: `credit-hub: ${entry.name} 429 限流，${wait}ms 后重试（${attempt + 1}/2）` })
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, wait)
+          timer.unref?.()
+          signal?.addEventListener?.('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+        })
+        normalizer = createNormalizer(wire, onChunk)
+        sawEvent = false
+      }
     }
     const outcome = normalizer.outcome()
     if (outcome.sawFinish !== true || outcome.finish === 'failed') {

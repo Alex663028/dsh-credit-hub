@@ -76,11 +76,16 @@ export function createNormalizer(wire, emit) {
     const output = numberOr(usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens)
     const reasoning = numberOr(usage.reasoning_tokens ?? usage.reasoningTokens ?? usage.completion_tokens_details?.reasoning_tokens)
     const cacheRead = numberOr(usage.cache_read_input_tokens ?? usage.cacheReadTokens ?? usage.prompt_tokens_details?.cached_tokens)
-    if (input === undefined && output === undefined) return
     // Anthropic splits usage across frames (message_start → input, message_delta →
-    // output); merge over the previous frame instead of replacing it.
+    // output), and some frames carry only reasoning/cache counters. Only bail when
+    // the frame has *no* counters at all, so a reasoning-only frame isn't dropped.
+    if (input === undefined && output === undefined && reasoning === undefined && cacheRead === undefined) return
+    // Start from a full copy of the previous merged usage so keys from earlier
+    // frames (reasoningTokens / cacheReadTokens / ...) are never lost, then
+    // overlay this frame's values on top.
     const previous = state.usage ?? {}
     state.usage = {
+      ...previous,
       inputTokens: input ?? previous.inputTokens ?? 0,
       outputTokens: output ?? previous.outputTokens ?? 0,
       ...(reasoning !== undefined ? { reasoningTokens: reasoning } : {}),

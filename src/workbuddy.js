@@ -33,6 +33,28 @@ const CHAT_UA = {
 }
 const MODELS_UA = 'CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0'
 
+/** 降级告警去重：同一原因只报一次，避免每次拉目录都刷屏。 */
+const degradationWarned = new Set()
+
+/**
+ * 目录 id 是 `wb/<realm>/<model>`（见 listModels），而 streamTurn 早期接口
+ * 直接收 `<realm>/<model>`。两种都认，且 global 必须走国际版账号池。
+ * 旧实现只切第一段：`wb/cn/hy4free` 会被拆成 realm=cn / model=`cn/hy4free`，
+ * 上游必然 400/11102「service info not found」；`wb/global/*` 还会被误投到
+ * 国内版账号。同时 `${realm}/${bare}` 负缓存 key 也因此永远对不上。
+ */
+export function parseWorkbuddyModelId(modelId) {
+  const raw = String(modelId ?? '')
+  const parts = raw.split('/')
+  if (parts[0] === 'wb' && parts.length >= 3) {
+    return { realm: parts[1] === 'global' ? 'global' : 'cn', bare: parts.slice(2).join('/') }
+  }
+  if (parts.length >= 2) {
+    return { realm: parts[0] === 'global' ? 'global' : 'cn', bare: parts.slice(1).join('/') }
+  }
+  return { realm: 'cn', bare: raw }
+}
+
 const staticCatalog = [
   { id: 'default-model', name: 'WorkBuddy Auto', contextWindow: 168000, maxOutput: 16384 },
   { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 1000000, maxOutput: 384000, reasoning: true, efforts: ['high'] },
@@ -366,7 +388,12 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
       const rows = findModelRows(body)
       if (rows.length > 0) entries = rows.map(toEntry).filter(Boolean)
     } catch (error) {
-      log?.(`credit-hub: workbuddy ${realm} v3/config 拉取失败（${error?.message ?? error}），先用静态清单`)
+      // 旧版把字符串传给 log()，被展开成 8 行逐字符畸形日志；且静默回退无记录
+      const reason = `v3/config:${realm}:${error?.message ?? error}`
+      if (!degradationWarned.has(reason)) {
+        degradationWarned.add(reason)
+        log?.({ scope: 'workbuddy', level: 'warn', message: `credit-hub: workbuddy ${realm} v3/config 拉取失败（${error?.message ?? error}），先用静态清单` })
+      }
     }
     if (!entries) entries = staticCatalog
     // 11102 负缓存：上游明确拒绝的模型在目录里隐藏 30 分钟（到期自动回验），
@@ -427,11 +454,18 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
 
   // ── chat turn（轮转 + 错误分类） ──────────────────────────────────────────
   async function streamTurn({ modelId, options, signal, onChunk }) {
-    const slashAt = modelId.indexOf('/')
-    const realm = modelId.slice(0, slashAt) === 'global' ? 'global' : 'cn'
-    const bare = modelId.slice(slashAt + 1)
+    const { realm, bare } = parseWorkbuddyModelId(modelId)
     const entries = await fetchModels(realm)
-    const entry = entries.find(row => row.id === bare) ?? { id: bare, name: bare, contextWindow: 128000, maxOutput: 16384 }
+    const found = entries.find(row => row.id === bare)
+    const entry = found ?? { id: bare, name: bare, contextWindow: 128000, maxOutput: 16384 }
+    if (!found) {
+      // 旧版对未知模型静默兜底照发请求，用户只看到上游 400/11102，无从定位
+      const reason = `unknown-model:${realm}/${bare}`
+      if (!degradationWarned.has(reason)) {
+        degradationWarned.add(reason)
+        warn?.(`credit-hub: workbuddy 目录里找不到 ${realm}/${bare}，用默认参数兜底照发（可能 400/11102）`)
+      }
+    }
     const warnings = []
     const messages = toChatMessages(options.messages, warnings)
     // 国际版硬约束（wb2api payload.go 的 ensureConsoleSystem 同款）：首条消息
@@ -499,7 +533,7 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
         const status = error?.status
         const verdict = classify(status, error?.envelope, error?.message)
         lastError = error
-        tried.push(`${account.label}:${verdict}`)
+        tried.push(`${account.label}:${verdict}${error?.retryAfterMs ? `(retry-after=${error.retryAfterMs}ms)` : ''}`)
         if (verdict === 'channel-refused' || verdict === 'busy' || verdict === 'content-blocked') continue
         if (verdict === 'session-dead') {
           const ok = await refreshAccount(account).catch(() => false)
@@ -511,8 +545,13 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
           modelBlockUntil.set(`${realm}/${bare}`, now() + 30 * 60_000)
           modelCache.delete(realm)
         }
-        if (verdict !== 'model-rate' && verdict !== 'soft-rate' && verdict !== 'model-blocked') continue
-        break
+        // soft-rate 是账号级软限流：换下一个账号仍有机会，旧版直接 break
+        // 白白放弃了账号池。模型级限流/封禁换账号无用，才停止轮转。
+        if (verdict === 'model-rate' || verdict === 'model-blocked') {
+          if (error?.retryAfterMs) warn?.(`credit-hub: workbuddy 模型级限流，上游建议 ${error.retryAfterMs}ms 后重试`)
+          break
+        }
+        continue
       }
     }
     throw lastError ?? new UpstreamError(`workbuddy 轮转耗尽：${tried.join('; ')}`, CODE.server)
@@ -541,20 +580,31 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
         body = await postJson(`${base}/v2/billing/meter/get-user-resource`, { headers: billingHeaders(account), body: { PageNumber: 1, PageSize: 100, ProductCode: 'p_tcaca', Status: [0, 3], ...billingWindow() } })
       } else throw error
     }
+    // 上游两种响应形状混算，且 CapacityRemain / DeductionEndTime 可能是脏值：
+    // NaN、负数、秒与毫秒混用都会把积分显示搞错，统一先校验再归一。
+    const safeNum = value => {
+      const n = Number(value)
+      return Number.isFinite(n) && n >= 0 ? n : 0
+    }
+    const normalizeEpoch = value => {
+      const n = Number(value)
+      if (!Number.isFinite(n) || n <= 0) return undefined
+      return n < 1e11 ? n * 1000 : n
+    }
     const rows = body?.data?.Response?.Data?.Accounts
     let remain = 0
     let total = 0
     let expireAt
     if (Array.isArray(rows)) {
       for (const pack of rows) {
-        remain += Number(pack.CapacityRemain ?? 0)
-        total += Number(pack.CapacitySize ?? pack.CapacityRemain ?? 0)
-        const end = Number(pack.DeductionEndTime ?? 0)
-        if (end > 0 && (expireAt === undefined || end < expireAt)) expireAt = end
+        remain += safeNum(pack.CapacityRemain)
+        total += safeNum(pack.CapacitySize ?? pack.CapacityRemain)
+        const end = normalizeEpoch(pack.DeductionEndTime)
+        if (end !== undefined && (expireAt === undefined || end < expireAt)) expireAt = end
       }
     } else if (body?.data?.credit !== undefined) {
-      total = Number(body.data.limitNum ?? 0)
-      remain = Math.max(0, total - Number(body.data.credit ?? 0))
+      total = safeNum(body.data.limitNum)
+      remain = Math.max(0, total - safeNum(body.data.credit))
     }
     account.credits = { remain, total, expireAt, updatedAt: now() }
     writeAccounts(readAccounts())

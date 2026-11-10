@@ -125,7 +125,10 @@ export function createPackBridge({ logger, warn } = {}) {
       if (efforts.length > 0) {
         meta = { efforts, defaultEffort: typeof r.defaultEffort === 'string' ? r.defaultEffort : efforts[efforts.length - 1] }
       }
-    } catch {}
+    } catch (error) {
+      // 旧版静默吞掉：推理档位探测失败会让模型看起来「不支持思考」，且无从排查
+      warn?.(`credit-hub: pack 桥接读取 ${provider}/${model} 推理档位失败（${error?.message ?? error}）`)
+    }
     modelMeta.set(key, meta)
     return meta
   }
@@ -252,7 +255,10 @@ export function createPackBridge({ logger, warn } = {}) {
       messages: gwMessages,
       // 与 pack 自家网关同构：tools/stop 空时整个省略（undefined），不传空数组
       ...(tools.length > 0 ? { tools } : {}),
-      ...(Number.isFinite(options?.maxTokens) ? { maxTokens: options.maxTokens } : {}),
+      // clamp：外部传来的 maxTokens 不再裸透传给宿主 llm（NaN/超大值会打崩上游）
+      ...(Number.isFinite(options?.maxTokens)
+        ? { maxTokens: Math.min(Math.max(Math.floor(options.maxTokens), 1), 200000) }
+        : {}),
       ...(typeof options?.temperature === 'number' ? { temperature: options.temperature } : {}),
       ...(Array.isArray(options?.stop) && options.stop.length > 0 ? { stop: options.stop } : {}),
       ...reasoningPatch,

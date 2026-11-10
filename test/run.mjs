@@ -17,9 +17,11 @@ import { sanitizeEfforts, finiteOr } from '../src/util.js'
 import { createStores, mintKey } from '../src/store.js'
 import { createHubRuntime } from '../src/hub.js'
 import { createUpstreamRuntime } from '../src/aggregate.js'
-import { createWorkbuddyRuntime } from '../src/workbuddy.js'
-import { startGateway } from '../src/forward.js'
+import { createWorkbuddyRuntime, parseWorkbuddyModelId } from '../src/workbuddy.js'
+import { startGateway, clampMaxTokens } from '../src/forward.js'
 import { createPackBridge, parsePackModelId } from '../src/pack-bridge.js'
+import { packStateView, packStateFiles } from '../src/pack-mount.js'
+import { createApiRoutes } from '../src/api.js'
 import { postSse } from '../src/http.js'
 import { createRing } from '../src/util.js'
 
@@ -255,6 +257,50 @@ await testAsync('combo silence watchdog advances past a hung candidate', async (
   assert(Date.now() - started < 10_000, `advanced in ${Date.now() - started}ms`)
   assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), 'up-aup-b')
   assert(chunks.some(c => c.type === 'finish' && c.reason.kind === 'stop'))
+  stores.dispose()
+  await rmDir(dir)
+})
+
+// ── 回归：目录 id 解析与单模型回合看门狗 ────────────────────────────────────
+test('parseWorkbuddyModelId strips wb/<realm> prefix and keeps global realm', () => {
+  assert.deepStrictEqual(parseWorkbuddyModelId('wb/cn/hy4free'), { realm: 'cn', bare: 'hy4free' })
+  assert.deepStrictEqual(parseWorkbuddyModelId('wb/cn/deepseek-v4.1-flash'), { realm: 'cn', bare: 'deepseek-v4.1-flash' })
+  assert.deepStrictEqual(parseWorkbuddyModelId('wb/global/default-model'), { realm: 'global', bare: 'default-model' })
+  assert.deepStrictEqual(parseWorkbuddyModelId('cn/hy4free'), { realm: 'cn', bare: 'hy4free' })
+  assert.deepStrictEqual(parseWorkbuddyModelId('global/auto-chat'), { realm: 'global', bare: 'auto-chat' })
+  assert.deepStrictEqual(parseWorkbuddyModelId('wb/cn/a/b'), { realm: 'cn', bare: 'a/b' })
+  // 回归点：旧实现会把 wb/cn/hy4free 拆成 cn/cn/hy4free，上游必报 11102
+  assert.notEqual(parseWorkbuddyModelId('wb/cn/hy4free').bare, 'cn/hy4free')
+})
+
+await testAsync('single-turn silence watchdog fails fast and aborts a hung upstream', async () => {
+  const dir = tmpDir('ch-single-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, singleSilenceMs: 500 }))
+  let aborted = false
+  const silent = {
+    listModels: async () => [{ id: 'wb/hung', source: 'workbuddy', name: 'Hung', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: ({ signal }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ sawFinish: true, finish: 'stop' }), 30_000)
+      signal?.addEventListener('abort', () => { aborted = true; clearTimeout(timer); reject(new Error('aborted')) })
+    }),
+    status: () => ({ accounts: 1, ok: 1 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: silent, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  const started = Date.now()
+  const chunks = []
+  const call = await hub.adapter.prepareCall('credit-hub', 'wb/hung')
+  for await (const chunk of call.stream({ model: 'wb/hung', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk)
+  const elapsed = Date.now() - started
+  assert(elapsed < 8000, `must fail fast (took ${elapsed}ms)`)
+  assert(aborted, 'hung upstream request was actually aborted')
+  const finish = chunks.find(c => c.type === 'finish')
+  assert.equal(finish?.reason?.kind, 'error', 'no clean stop on timeout')
+  assert.equal(finish?.reason?.failure?.code, 'TIMEOUT')
+  assert.match(finish?.reason?.failure?.message ?? '', /无任何输出/)
   stores.dispose()
   await rmDir(dir)
 })
@@ -524,17 +570,26 @@ await testAsync('apply() boots with a mock host ctx', async () => {
   const mockCtx = {
     logger: { info: () => {}, warn: () => {} },
     llm: { registerAdapter: () => () => {}, emitAdaptersUpdated: () => {}, stream: async function * () {} },
-    inject: (deps, cb) => injected.push({ deps, cb }),
+    // 真执行回调：旧版桩只记录不执行，createApiRoutes / mountAccountPack 两条
+    // 分支（也就是 host 崩溃的高发路径）从未被测过。
+    inject: (deps, cb) => {
+      const row = { deps, cb, executed: false }
+      injected.push(row)
+      const scoped = { ...mockCtx, webServer: { register: () => () => {} }, effect: fn => effects.push(fn) }
+      try { cb(scoped); row.executed = true } catch (error) { throw new Error(`inject(${deps.join(',')}) threw: ${error.message}`) }
+    },
     effect: fn => effects.push(fn),
     on: () => () => {},
     emit: () => {},
     get: () => undefined,
   }
   let threw = null
-  try { apply(mockCtx, {}) } catch (error) { threw = error }
+  // accountPack:'off' 避免冒烟测试真的去 import 2.6MB 的 vendor pack（会起服务/定时器）
+  try { apply(mockCtx, { accountPack: 'off' }) } catch (error) { threw = error }
   assert.equal(threw, null, `apply() threw at load: ${threw}`)
   assert(injected.some(row => row.deps.includes('webServer')), 'webServer api wired')
   assert(injected.some(row => row.deps.includes('credentials')), 'account pack wired')
+  assert(injected.every(row => row.executed), 'all inject callbacks actually ran')
   assert(effects.length >= 3, `lifecycle effects registered (${effects.length})`)
   // 跑一遍 setup 拿 disposer，清理定时器/网关/stores
   for (const fn of effects) {
@@ -569,6 +624,119 @@ await testAsync('thinking default-off applies only when caller omits effort', as
   const call3 = await hub.adapter.prepareCall('credit-hub', 'wb/cn/glm-5.3')
   for await (const chunk of call3.stream({ model: 'wb/cn/glm-5.3', messages: [{ role: 'user', content: 'hi' }], reasoningEffort: 'high' })) void chunk
   assert.equal(seen[2], 'high', 'explicit effort wins over toggle')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+// ── 回归：本次修复的缺陷逐条上锁 ──────────────────────────────────────────
+test('clampMaxTokens rejects NaN / negative / oversized values', () => {
+  assert.equal(clampMaxTokens(NaN), 8192)
+  assert.equal(clampMaxTokens(-1), 8192)
+  assert.equal(clampMaxTokens('abc'), 8192)
+  assert.equal(clampMaxTokens(999999), 200000)
+  assert.equal(clampMaxTokens(100), 100)
+})
+
+test('pack state view reads legacy nested directory (no data migration needed)', () => {
+  const dir = tmpDir('ch-packstate-')
+  const stores = createStores(dir)
+  const nested = path.join(dir, 'credit-hub', 'channel-pack', 'channel-pack')
+  fs.mkdirSync(nested, { recursive: true })
+  fs.writeFileSync(path.join(nested, 'state.json'), JSON.stringify({
+    accounts: { 'qoder:a1': { provider: 'qoder', nickname: 'A', credits: 12 } },
+  }))
+  const view = packStateView(stores)
+  assert.equal(view.length, 1, 'legacy nested state.json must be visible')
+  assert.equal(view[0].provider, 'qoder')
+  assert.equal(packStateFiles(stores).length, 2)
+  stores.dispose()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('stores.migrate() upgrades schemaVersion and clears legacy checkin marks', () => {
+  const dir = tmpDir('ch-migrate-')
+  const stores = createStores(dir)
+  fs.writeFileSync(path.join(dir, 'credit-hub', 'settings.json'), JSON.stringify({
+    checkinMarks: { '2026-11-07': true, '2026-11-08:wb_a': 'ok' },
+  }))
+  const result = stores.migrate()
+  assert.equal(result.changed, true)
+  const settings = stores.settings.load()
+  assert.equal(settings.schemaVersion, 2)
+  assert.equal(settings.checkinMarks['2026-11-07'], undefined, 'legacy boolean key removed')
+  assert.equal(settings.checkinMarks['2026-11-08:wb_a'], 'ok', 'new-format key preserved')
+  stores.dispose()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+await testAsync('gateway start is single-flight; stop survives a live SSE and frees the port', async () => {
+  const dir = tmpDir('ch-life-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 20000 + Math.floor(Math.random() * 20000) }))
+  const workbuddy = makeSource('wb')
+  const upstreams = makeSource('up')
+  const hub = createHubRuntime({ stores, workbuddy, upstreams, logger: console, warn: () => {} })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  let results = await Promise.allSettled([gateway.start(), gateway.start()])
+  for (let attempt = 0; attempt < 4 && results.some(r => r.status === 'rejected'); attempt += 1) {
+    stores.settings.update(s => ({ ...s, gatewayPort: s.gatewayPort + 517 }))
+    results = await Promise.allSettled([gateway.start(), gateway.start()])
+  }
+  assert(results.every(r => r.status === 'fulfilled'), `concurrent start: ${results.map(r => r.reason?.message).join(', ')}`)
+  assert.equal(results[0].value, results[1].value, 'both callers see the same bind')
+  const bind = results[0].value
+
+  // 制造一条不会自行结束的 SSE 连接（unref 定时器，不拖住测试进程退出）
+  workbuddy.streamTurn = async ({ onChunk }) => {
+    onChunk({ type: 'text-delta', index: 0, text: 'x' })
+    await new Promise(resolve => { const t = setTimeout(resolve, 10_000); t.unref?.() })
+    return { sawText: true, sawFinish: true, finish: 'stop', usage: { inputTokens: 1, outputTokens: 1 }, nextIndex: 0 }
+  }
+  const controller = new AbortController()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  await fetch(`http://${bind}/v1/chat/completions`, {
+    method: 'POST', headers: auth, signal: controller.signal,
+    body: JSON.stringify({ model: 'wb/m1', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+  })
+  const stopped = await Promise.race([
+    gateway.stop().then(() => 'stopped'),
+    new Promise(resolve => setTimeout(() => resolve('timeout'), 2500)),
+  ])
+  controller.abort()
+  assert.equal(stopped, 'stopped', 'stop() must not hang on a live SSE connection')
+  assert.equal(gateway.running, false)
+  const bind2 = await gateway.start()
+  assert.equal(bind2, bind, 'port is released after stop')
+  await gateway.stop()
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('management API rejects non-loopback host / origin / cross-site requests', async () => {
+  const dir = tmpDir('ch-api-guard-')
+  const stores = createStores(dir)
+  const api = createApiRoutes({
+    stores, hub: {}, workbuddy: {}, upstreams: {},
+    gateway: { running: false, stats: () => ({}) },
+    version: 'test', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    log: () => {}, warn: () => {},
+  })
+  const invoke = headers => new Promise((resolve, reject) => {
+    const req = { url: '/api/credit-hub/logs', method: 'GET', headers }
+    const res = {
+      statusCode: 0, headersSent: false, writableEnded: false,
+      writeHead(status) { this.statusCode = status; this.headersSent = true },
+      end() { resolve(this.statusCode) },
+      setHeader() {}, write() {},
+    }
+    const timeout = setTimeout(() => reject(new Error('api handler did not respond')), 2000)
+    timeout.unref?.()
+    api(req, res)
+  })
+  assert.equal(await invoke({ host: '127.0.0.1:8330' }), 200, 'loopback allowed')
+  assert.equal(await invoke({ host: 'evil.example' }), 403, 'non-loopback host blocked')
+  assert.equal(await invoke({ host: '127.0.0.1:8330', origin: 'https://evil.example' }), 403, 'cross-origin blocked')
+  assert.equal(await invoke({ host: '127.0.0.1:8330', 'sec-fetch-site': 'cross-site' }), 403, 'cross-site fetch blocked')
   stores.dispose()
   await rmDir(dir)
 })

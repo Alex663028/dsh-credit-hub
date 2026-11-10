@@ -32,6 +32,13 @@ const openAiUsage = usage => usage ? {
 
 const MAX_BODY = 32 * 1024 * 1024
 
+/** 统一 clamp：调用方传 NaN / 负数 / 超大值时不会把上游打崩。 */
+export const clampMaxTokens = value => {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return 8192
+  return Math.min(Math.floor(n), 200000)
+}
+
 export function loadOrCreateApiKey(gatewayDir) {
   fs.mkdirSync(gatewayDir, { recursive: true, mode: 0o700 })
   const file = path.join(gatewayDir, 'api-key')
@@ -66,8 +73,10 @@ export function startGateway({ stores, hub, logger, settings, log }) {
   let apiKey = loadOrCreateApiKey(stores.gatewayDir)
   let servers = []
   let stats = { requests: 0, ok: 0, failed: 0, lastAt: 0 }
+  let starting = null
+  let boundPort = null
 
-  const bind = () => `127.0.0.1:${currentPort()}`
+  const bind = () => `127.0.0.1:${boundPort ?? currentPort()}`
 
   const currentPort = () => {
     const value = Number(settings().gatewayPort)
@@ -80,8 +89,9 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     req.on('data', chunk => {
       size += chunk.length
       if (size > MAX_BODY) {
+        // 不要 destroy：响应还没发出去，先把剩余数据排空再让上层回 413
+        req.resume()
         reject(Object.assign(new Error('body too large'), { statusCode: 413 }))
-        req.destroy()
         return
       }
       chunks.push(chunk)
@@ -104,9 +114,13 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     if (authHeader.toLowerCase().startsWith('bearer ')) candidates.push(authHeader.slice(7).trim())
     candidates.push(String(req.headers['x-api-key'] ?? '').trim())
     candidates.push(String(req.headers['api-key'] ?? '').trim())
-    try {
-      candidates.push(new URL(req.url ?? '/', 'http://localhost').searchParams.get('key') ?? '')
-    } catch {}
+    // ?key= 默认关闭：Key 会留在 URL / 浏览器历史 / Referer 里。需要兼容旧客户端
+    // 时在设置里显式开 allowQueryKey。
+    if (settings().allowQueryKey === true) {
+      try {
+        candidates.push(new URL(req.url ?? '/', 'http://localhost').searchParams.get('key') ?? '')
+      } catch {}
+    }
     for (const candidate of candidates) {
       const value = candidate.replace(/^bearer\s+/i, '').trim()
       if (value && keyMatches(value, apiKey)) return true
@@ -178,7 +192,14 @@ export function startGateway({ stores, hub, logger, settings, log }) {
             results.push({ type: 'tool-result', toolCallId: String(block.tool_use_id ?? ''), content: [{ type: 'text', text: inner }] })
           }
         }
-        out.push(results.length > 0 ? { role: 'tool', content: results } : { role: 'user', content: blocks })
+        // 混合内容（同一条 user 消息里既有文本又有 tool_result）必须两条都保留，
+        // 旧版二选一会把普通文本静默丢掉。
+        if (results.length > 0 && blocks.length > 0) {
+          out.push({ role: 'user', content: blocks })
+          out.push({ role: 'tool', content: results })
+        } else {
+          out.push(results.length > 0 ? { role: 'tool', content: results } : { role: 'user', content: blocks })
+        }
         continue
       }
       if (message.role === 'assistant') {
@@ -198,7 +219,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
   const harnessOptions = (body, messages, wire) => ({
     model: String(body.model ?? ''),
     messages,
-    maxTokens: Number(body.max_tokens ?? body.max_completion_tokens ?? body.maxOutputTokens ?? 8192),
+    maxTokens: clampMaxTokens(body.max_tokens ?? body.max_completion_tokens ?? body.maxOutputTokens ?? 8192),
     ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
     ...(Array.isArray(body.stop) ? { stop: body.stop } : typeof body.stop === 'string' && body.stop ? { stop: [body.stop] } : {}),
     ...(Array.isArray(body.tools) && body.tools.length > 0 ? { tools: body.tools } : {}),
@@ -644,41 +665,61 @@ export function startGateway({ stores, hub, logger, settings, log }) {
   }
 
   // ── server ────────────────────────────────────────────────────────────────
-  async function start() {
-    if (servers.length > 0) return bind()
+  async function doStart() {
     const port = currentPort()
-    const handler = async (req, res) => {
-      const url = new URL(req.url ?? '/', 'http://localhost')
-      const routePath = url.pathname.replace(/\/+$/, '') || '/'
-      stats.requests += 1
-      // 浏览器内运行的 agent（webview/页面形态）需要 CORS + 预检；桌面/CLI
-      // agent 不受影响。Key 鉴权仍然照常把关。
-      const cors = {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'authorization, content-type, anthropic-version, x-api-key, x-api-key-hash',
-        'access-control-max-age': '86400',
-      }
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, cors)
-        return res.end()
-      }
-      res.setHeader('access-control-allow-origin', cors['access-control-allow-origin'])
-      let rawBody = ''
+    const handle = async (req, res) => {
+      let routePath = '/'
+      // try 必须包住 URL 解析与 setHeader：旧版这两处在 try 之外，抛错即成
+      // unhandledRejection → host 退出。
       try {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        routePath = url.pathname.replace(/\/+$/, '') || '/'
+        stats.requests += 1
+        // CORS 只放行回环来源：旧版 `*` + 无鉴权管理面等于把网关 Key 交给任意网页
+        const origin = String(req.headers.origin ?? '')
+        // Electron / file:// 页面的 Origin 常是 `null`：本地页面放行并回显，
+        // 但 http(s) 跨站来源一律拒绝，不再无条件 `*`。
+        const localOrigin = origin === '' || origin === 'null' || /^file:\/\//i.test(origin)
+          || /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(origin)
+        const crossSite = origin !== '' && !localOrigin
+        const allowOrigin = origin === '' ? null : (localOrigin ? origin : null)
+        const cors = {
+          ...(allowOrigin ? { 'access-control-allow-origin': allowOrigin } : {}),
+          'access-control-allow-methods': 'GET, POST, OPTIONS',
+          'access-control-allow-headers': 'authorization, content-type, anthropic-version, x-api-key, x-api-key-hash',
+          'access-control-max-age': '86400',
+          vary: 'Origin',
+        }
+        if (req.method === 'OPTIONS') {
+          if (crossSite) return send(res, 403, { error: 'cross-origin not allowed' })
+          res.writeHead(204, cors)
+          return res.end()
+        }
+        if (allowOrigin) res.setHeader('access-control-allow-origin', allowOrigin)
+        let rawBody = ''
         if (routePath === '/healthz') return send(res, 200, { ok: true })
         const keyOk = authorized(req)
         if (!keyOk) {
           // 401 也留痕：调用方 Key 配错是最高频的接入问题
-          log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配，key 头前 6 位: ${String(req.headers.authorization ?? req.headers['x-api-key'] ?? '').slice(0, 12)}）` })
-          return send(res, 401, { error: { message: 'invalid gateway key — 请把网关页显示的完整 Key 粘贴到 EKKO 渠道配置的 API Key 字段（也可在 base_url 后加 ?key=<网关Key>）', type: 'auth_error' } })
+          // 不再把 Key 头前缀写进日志；也不再鼓励把 Key 放进 URL
+          log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配）` })
+          return send(res, 401, { error: { message: 'invalid gateway key — 请把网关页显示的 Key 填入 Authorization: Bearer 或 x-api-key 请求头', type: 'auth_error' } })
         }
         if (req.method === 'POST' && routePath.startsWith('/v1/')) {
           // 请求体预览落日志：调用方接入排查的第一现场
           rawBody = await readBody(req)
+          // 只记元数据，绝不把请求体（system prompt / 对话内容）写进日志
           let modelPreview = ''
-          try { modelPreview = String(JSON.parse(rawBody || '{}')?.model ?? '') } catch {}
-          log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} body=${rawBody.slice(0, 1500)}` })
+          let bytes = 0
+          let messageCount = 0
+          try {
+            const parsed = JSON.parse(rawBody || '{}')
+            modelPreview = String(parsed?.model ?? '')
+            bytes = Buffer.byteLength(rawBody)
+            messageCount = Array.isArray(parsed?.messages) ? parsed.messages.length
+              : Array.isArray(parsed?.input) ? parsed.input.length : 0
+          } catch {}
+          log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} bytes=${bytes} messages=${messageCount}` })
         }
         if (req.method === 'GET' && routePath === '/v1/models') {
           const rows = await hub.catalog()
@@ -693,7 +734,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           const options = {
             model: String(body.model ?? ''),
             messages: responsesInputToHarness(body),
-            maxTokens: Number(body.max_output_tokens ?? body.max_tokens ?? 8192),
+            maxTokens: clampMaxTokens(body.max_output_tokens ?? body.max_tokens ?? 8192),
             ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
             ...(Array.isArray(body.stop) ? { stop: body.stop } : {}),
             ...(tools.length > 0 ? { tools } : {}),
@@ -719,7 +760,8 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           const result = body.stream === true
             ? await streamOpenAi(res, options, options.model, signal.signal)
             : await completeOpenAi(res, options, options.model, signal.signal)
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${result.error ? String(result.error.message ?? JSON.stringify(result.error)).slice(0, 160) : '（无 error 信息——旧代码或中断）'}`}` })
+          const resultError = result.ok ? null : (result.error ?? { message: 'upstream failed without error details' })
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(resultError.message ?? JSON.stringify(resultError)).slice(0, 160)}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
@@ -732,7 +774,8 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           const result = body.stream === true
             ? await streamClaude(res, options, options.model, signal.signal)
             : await completeClaude(res, options, options.model, signal.signal)
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${result.error ? String(result.error.message ?? JSON.stringify(result.error)).slice(0, 160) : '（无 error 信息——旧代码或中断）'}`}` })
+          const resultError = result.ok ? null : (result.error ?? { message: 'upstream failed without error details' })
+          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(resultError.message ?? JSON.stringify(resultError)).slice(0, 160)}`}` })
           stats[result.ok ? 'ok' : 'failed'] += 1
           stats.lastAt = now()
           return
@@ -751,15 +794,38 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         stats.failed += 1
       }
     }
+    // http.createServer 不消费 async 返回的 promise —— 必须显式 catch，
+    // 否则任何漏网异常都变成 unhandledRejection 带崩 host。
+    const handler = (req, res) => {
+      void handle(req, res).catch(error => {
+        logger?.warn?.(`credit-hub gateway: 未捕获的处理器异常：${error?.message ?? error}`)
+        log?.({ scope: 'gateway', level: 'error', message: `unhandled handler error: ${error?.message ?? error}` })
+        if (!res.writableEnded) send(res, 500, { error: { message: 'internal gateway error', type: 'gateway_error' } })
+      })
+    }
     // 双栈回环：只绑 127.0.0.1 时，把 base_url 写成 localhost 的 agent 会先解析
     // 到 ::1 → ECONNREFUSED。IPv4/IPv6 两条 socket 可共用同一端口号。
     const listenOn = (host, family) => new Promise((resolve, reject) => {
       const server = http.createServer(handler)
-      server.once('error', reject)
-      server.listen(port, host, () => resolve(server))
+      const onListenError = error => {
+        try { server.close() } catch {}
+        reject(error)
+      }
+      server.once('error', onListenError)
+      server.listen(port, host, () => {
+        server.removeListener('error', onListenError)
+        // 常驻兜底：旧版 once 被消费后，第二次运行期 error 没有监听器 →
+        // 未捕获 'error' 事件直接退出进程。
+        server.on('error', error => {
+          logger?.warn?.(`credit-hub: 网关 server error：${error?.message ?? error}`)
+          log?.({ scope: 'gateway', level: 'error', message: `server error: ${error?.message ?? error}` })
+        })
+        resolve(server)
+      })
     })
     const ipv4 = await listenOn('127.0.0.1', 4)
     servers.push(ipv4)
+    boundPort = port
     try {
       const ipv6 = await listenOn('::1', 6)
       servers.push(ipv6)
@@ -770,10 +836,27 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     return bind()
   }
 
+  /** 单飞：boot effect / 保存设置 / restart 并发触发时只 listen 一次。 */
+  async function start() {
+    if (servers.length > 0) return bind()
+    if (starting) return starting
+    starting = doStart().finally(() => { starting = null })
+    return starting
+  }
+
   async function stop() {
     const closing = servers
     servers = []
-    await Promise.all(closing.map(server => new Promise(resolve => server.close(() => resolve()))))
+    boundPort = null
+    if (starting) { try { await starting } catch {} }
+    await Promise.all(closing.map(server => new Promise(resolve => {
+      let done = false
+      const finish = () => { if (!done) { done = true; resolve() } }
+      // 活跃 SSE 长连接会让 server.close() 永不回调 → 先强制断连 + 1.5s 兜底超时
+      try { server.closeAllConnections?.() } catch {}
+      try { server.close(finish) } catch { finish() }
+      setTimeout(finish, 1500).unref?.()
+    })))
   }
 
   return {

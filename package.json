@@ -1,6 +1,6 @@
 {
   "name": "dsh-credit-hub",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "type": "module",
   "description": "积分汇通 — 把各家 coding agent 的账号积分渠道（WorkBuddy/CodeBuddy、Raccoon 商汤小浣熊、Qoder、ZCode、MiniMax、TRAE 等）与自填的官方 API / 任意 OpenAI 兼容中转，汇成一条统一模型车道与一个本地 OpenAI + Anthropic 兼容网关；含账号池、积分查询、降级链与用量看板。",
   "main": "./index.js",
@@ -63,6 +63,12 @@
     "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-credentials": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true }
   },
   "publishConfig": {
     "access": "public"
