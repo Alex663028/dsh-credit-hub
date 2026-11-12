@@ -85,7 +85,10 @@ export async function mountAccountPack(ctx, { settings, stores, logger, warn }) 
     pack = await import('../vendor/channel-pack/pack.js')
     // 必须 await：pack.apply 内部若是 async，未 await 的 rejection 会逃逸成
     // unhandledRejection，直接带崩 DSH host（11-08 十次 exited with 1 的形态）。
-    const result = await pack.apply(ctx, { disableOpencode: true })
+    // OpenCode 是匿名免费车道（apiKey 字面量 public）：默认开启；settings.opencode
+    // 显式为 false 时禁用——那样 pack 不注册 opencode LLM 适配器，也不开放其账号 RPC。
+    const readSettings = settings ?? (() => stores.settings.load())
+    const result = await pack.apply(ctx, { disableOpencode: readSettings().opencode === false })
     if (typeof result === 'function') disposer = result
     else if (result && typeof result.dispose === 'function') disposer = () => result.dispose()
     markMounted()

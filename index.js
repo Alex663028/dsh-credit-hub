@@ -38,6 +38,7 @@ try {
     accountPack: Schema.union(['auto', 'on', 'off']).default('auto').description('渠道包模式：auto 避让 ofm / on 独立反代 / off'),
     autoCheckin: Schema.boolean().default(false).description('WorkBuddy 每日自动签到'),
     thinkingOffByDefault: Schema.boolean().default(false).description('调用方未指定思考强度时默认关思考（提升简单客户端兼容性）'),
+    opencode: Schema.boolean().default(true).description('启用 OpenCode 匿名免费车道（关闭时跳过其适配器注册）'),
     packGateway: Schema.boolean().default(false).description('渠道包自带 8326 网关（单网关策略下保持关闭）'),
   }).description('积分汇通')
 } catch (error) {
@@ -56,6 +57,9 @@ const SETTINGS_DEFAULTS = {
   thinkingOffByDefault: false,
   // 单网关策略：8330 已通过 pack 桥接汇总全部模型，渠道包自带的 8326
   // 本地网关默认停用（进程级 env 硬开关，pack 的 RPC 也打不开）。
+  // OpenCode 匿名免费车道（apiKey 字面量 public，无需账号登录）：默认开启，
+  // 模型以 pk/opencode/<model> 汇入 8330 网关；与 ofm 共存时它会自行避让。
+  opencode: true,
   packGateway: false,
 }
 
