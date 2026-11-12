@@ -108,6 +108,11 @@
     'chan.credits': '查积分',
     'chan.checkin': '签到',
     'chan.claim': '一键领取',
+    'ci.run': '一键签到',
+    'ci.busy': '签到中…',
+    'ci.done': '签到完成：成功 {ok}，失败 {failed}',
+    'ci.none': '没有可签到的账号',
+    'ci.hint': '覆盖渠道包全部在用渠道 + WorkBuddy 国内账号',
     'chan.enable': '启用',
     'chan.disable': '停用',
     'chan.remove': '删除',
@@ -249,6 +254,11 @@
     'chan.credits': 'Credits',
     'chan.checkin': 'Check in',
     'chan.claim': 'Claim all',
+    'ci.run': 'Check in all',
+    'ci.busy': 'Checking in…',
+    'ci.done': 'Done: {ok} ok, {failed} failed',
+    'ci.none': 'Nothing to check in',
+    'ci.hint': 'Covers every active channel in the pack plus WorkBuddy CN accounts',
     'chan.enable': 'Enable',
     'chan.disable': 'Disable',
     'chan.remove': 'Remove',
@@ -491,6 +501,72 @@
       return { available: transport !== null, rpc }
     }
 
+    /**
+     * 一键签到：渠道包全部「在用」provider 领积分 + WorkBuddy 全部国内账号签到。
+     *
+     * 只对确实有账号的 provider 发 claimAll —— `/summary.pack.view` 已经给出
+     * 每个渠道的账号行（含 provider 与 disabled），据此收敛目标，避免对空渠道
+     * 发请求换来一堆「无账号」噪声错误。两类任务并行，失败逐条回收不中断其它。
+     */
+    async function runCheckinAll({ available, rpc }) {
+      const tasks = []
+      if (available) {
+        let providers = []
+        try {
+          const payload = await api('/summary')
+          const view = payload?.pack?.view ?? []
+          providers = [...new Set(view
+            .filter(row => row?.disabled !== true && typeof row?.provider === 'string' && row.provider !== '')
+            .map(row => row.provider))]
+        } catch {}
+        for (const provider of providers) {
+          tasks.push(rpc('credits.claimAll', { provider }, 120_000).then(
+            () => ({ ok: true, label: provider }),
+            error => ({ ok: false, label: provider, message: String(error?.message ?? error) })))
+        }
+      }
+      try {
+        const payload = await api('/workbuddy/accounts')
+        const accounts = (payload?.accounts ?? []).filter(row => row?.realm === 'cn' && row?.enabled !== false)
+        for (const account of accounts) {
+          const label = `WorkBuddy ${account?.label ?? account?.id ?? ''}`.trim()
+          tasks.push(api('/workbuddy/checkin', { id: account.id }).then(
+            () => ({ ok: true, label }),
+            error => ({ ok: false, label, message: String(error?.message ?? error) })))
+        }
+      } catch {}
+      const settled = await Promise.all(tasks)
+      return {
+        total: settled.length,
+        ok: settled.filter(row => row.ok).length,
+        failed: settled.filter(row => !row.ok),
+      }
+    }
+
+    /** 「一键签到」按钮（总览与账号渠道页共用）。 */
+    function CheckinAllButton({ ctx, showToast, onDone }) {
+      const { available, rpc } = useChannelRpc(ctx)
+      const [busy, setBusy] = useState(false)
+      const run = async () => {
+        setBusy(true)
+        try {
+          const result = await runCheckinAll({ available, rpc })
+          if (result.total === 0) showToast(t('ci.none'), 'warn')
+          else {
+            const text = fmt('ci.done', { ok: result.ok, failed: result.failed.length })
+            if (result.failed.length === 0) showToast(text)
+            else {
+              const detail = result.failed.map(row => `${row.label}(${row.message})`).join('；')
+              showToast(`${text} — ${detail}`, 'warn')
+            }
+          }
+          onDone?.()
+        } catch (error) { showToast(String(error?.message ?? error), 'warn') } finally { setBusy(false) }
+      }
+      return h(Btn, { kind: 'primary', small: true, busy, onClick: run, title: t('ci.hint') },
+        busy ? t('ci.busy') : t('ci.run'))
+    }
+
     // ── onboarding ─────────────────────────────────────────────────────────────
     const Onboarding = ({ settings, onSettings, goTab }) => {
       if (settings?.onboardingSeen === true) return null
@@ -507,9 +583,10 @@
     }
 
     // ── 总览 ───────────────────────────────────────────────────────────────────
-    function Overview({ settings, onSettings, goTab }) {
+    function Overview({ settings, onSettings, goTab, ctx }) {
       const [summary, setSummary] = useState(null)
       const [gateway, setGateway] = useState(null)
+      const [toast, showToast] = useToast()
       const load = useCallback(() => {
         void api('/summary').then(setSummary).catch(() => {})
         void api('/gateway').then(setGateway).catch(() => {})
@@ -543,6 +620,10 @@
       return h('div', { className: 'ch-stack' },
         h(Onboarding, { settings, onSettings, goTab }),
         statsBlock,
+        h(Card, { title: t('ci.run'), accent: '#31b573' },
+          h('div', { className: 'ch-row' },
+            h(CheckinAllButton, { ctx, showToast, onDone: load }),
+            h(Muted, null, t('ci.hint')))),
         h(Card, { title: t('ov.recipe'), accent: '#9d5cff' },
           h('div', { className: 'ch-grid2' },
             recipeCard(t('ov.recipe.openai'), openaiRecipe),
@@ -569,7 +650,8 @@
             h(Toggle, { label: t('ov.autoCheckin'), checked: settings.autoCheckin === true, onChange: value => onSettings({ autoCheckin: value }) }),
             h(Toggle, { label: t('ov.packGateway'), checked: settings.packGateway === true, onChange: value => onSettings({ packGateway: value }), title: t('ov.packGateway.hint') }),
             h(Btn, { small: true, onClick: load }, t('ov.refresh'))),
-          h('div', { className: 'ch-muted', style: { marginTop: '8px' } }, t('ov.layer.hint'))))
+          h('div', { className: 'ch-muted', style: { marginTop: '8px' } }, t('ov.layer.hint'))),
+        h(Toast, { toast }))
     }
 
     // ── WorkBuddy 卡 ───────────────────────────────────────────────────────────
@@ -903,6 +985,9 @@
         packOffline ? h('div', { className: 'ch-notice ch-notice-warn' },
           `${t('chan.pack.offLine')}（${packStatus.reason}）${packStatus.error ? ` — ${packStatus.error}` : ''} `,
           h(Btn, { small: true, onClick: diag }, t('chan.pack.diag'))) : null,
+        h('div', { className: 'ch-row' },
+          h(CheckinAllButton, { ctx, showToast, onDone: () => { void api('/summary').then(setSummary).catch(() => {}) } }),
+          h(Muted, null, t('ci.hint'))),
         h(WorkBuddyCard),
         h('div', { className: 'ch-cards-grid' }, CHANNEL_PROVIDERS.map((channel, index) => h(PackChannelCard, {
           key: channel.id, channel: { ...channel, offset: (index % 5) * 3000 }, rpc: available ? rpc : null, packNote,
@@ -1341,7 +1426,7 @@
       ]
       const goTab = id => setTab(id)
       const page = settings === null ? h('div', { className: 'ch-muted ch-pad' }, t('common.loading'))
-        : tab === 'overview' ? h(Overview, { settings, onSettings: patch, goTab })
+        : tab === 'overview' ? h(Overview, { settings, onSettings: patch, goTab, ctx: props?.ctx })
           : tab === 'channels' ? h(ChannelsPage, { ctx: props?.ctx })
             : tab === 'upstreams' ? h(UpstreamsPage)
               : tab === 'combos' ? h(CombosPage)
