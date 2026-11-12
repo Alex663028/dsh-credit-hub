@@ -26,11 +26,28 @@ import { createRing, now } from './src/util.js'
 const require = createRequire(import.meta.url)
 const { version } = require('./package.json')
 
+/**
+ * 解析 schemastery：`link:` 安装时插件真实路径在工作区，Node 从真实路径回溯
+ * 找不到 profile 里的 peerDeps（pnpm 明确警告过 link 不解析 peer）。这里退化为
+ * 从 profile 目录显式 createRequire，让配置面板在 link 安装下也能出现。
+ */
+function resolveSchemastery() {
+  try { return require('@deepseek-ai/schemastery') } catch {}
+  const bases = [process.env.DSH_PROFILE_DIR, process.env.DSH_HOME && path.join(process.env.DSH_HOME, 'profiles')]
+  for (const base of bases) {
+    if (typeof base !== 'string' || base === '') continue
+    try { return createRequire(path.join(base, 'noop.js'))('@deepseek-ai/schemastery') } catch {}
+  }
+  return undefined
+}
+
 /** schemastery 配置面（可选宿主依赖）：缺席时 Config 为 undefined，只影响
  * 宿主配置 UI 的呈现；运行态真身始终是 settings.json（config 仅作默认值层）。 */
 export let Config
 try {
-  const Schema = (await import('@deepseek-ai/schemastery')).default
+  const SchemaMod = resolveSchemastery()
+  if (!SchemaMod) throw new Error('MODULE_NOT_FOUND: @deepseek-ai/schemastery')
+  const Schema = SchemaMod.default ?? SchemaMod
   Config = Schema.object({
     enabled: Schema.boolean().default(true).description('启用积分汇通模型车道'),
     gatewayEnabled: Schema.boolean().default(true).description('启用本地网关（仅回环）'),
