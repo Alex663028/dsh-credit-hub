@@ -769,7 +769,6 @@
               account.lastError ? h('span', { className: 'ch-error', title: account.lastError }, '⚠') : null),
             h('div', { className: 'ch-rowline-actions' },
               h(Btn, { small: true, busy: busy === `c-${account.id}`, onClick: () => act(`c-${account.id}`, () => api('/workbuddy/credits', { id: account.id })) }, t('chan.credits')),
-              account.realm === 'cn' && h(Btn, { small: true, busy: busy === `k-${account.id}`, onClick: () => act(`k-${account.id}`, () => api('/workbuddy/checkin', { id: account.id }), '✔') }, t('chan.checkin')),
               h(Btn, { small: true, onClick: () => act(`e-${account.id}`, () => api('/workbuddy/enable', { id: account.id, enabled: account.enabled === false })) }, account.enabled === false ? t('chan.enable') : t('chan.disable')),
               h(Btn, { small: true, kind: 'danger', onClick: () => { if (!window.confirm(t('common.confirmRemove'))) return; act(`d-${account.id}`, () => api('/workbuddy/remove', { id: account.id })) } }, t('chan.remove'))))))
 
@@ -906,7 +905,6 @@
 
       const headActions = h('div', { className: 'ch-row' },
         h(Btn, { small: true, kind: 'primary', busy: busy === 'login' || login !== null, onClick: startLogin }, t('chan.login')),
-        (accounts?.length ?? 0) > 0 && h(Btn, { small: true, busy: busy === 'claim', onClick: () => act('claim', () => rpc('credits.claimAll', { provider: channel.id }, 180_000).then(() => showToast('✔')).catch(error => showToast(String(error.message), 'warn'))) }, t('chan.claim')),
         rpc !== null && h(Btn, { small: true, active: showModels, onClick: () => { const next = !showModels; setShowModels(next); if (next && models === null) loadModels() } },
           `${t('chan.modelsToggle')}${modelCount !== null ? ` · ${modelCount}` : ''}`))
 
