@@ -510,19 +510,25 @@
      */
     async function runCheckinAll({ available, rpc }) {
       const tasks = []
+      // opencode 是匿名免费车道（无账号、无积分可领），不参与签到。
+      const SKIP = new Set(['opencode'])
+      /** 「今天已签到 / 已领取」不是失败，是已完成。 */
+      const alreadyDone = message => /已签到|已领取|已领过|already/i.test(String(message ?? ''))
       if (available) {
         let providers = []
         try {
           const payload = await api('/summary')
           const view = payload?.pack?.view ?? []
           providers = [...new Set(view
-            .filter(row => row?.disabled !== true && typeof row?.provider === 'string' && row.provider !== '')
+            .filter(row => row?.disabled !== true && typeof row?.provider === 'string' && row.provider !== '' && !SKIP.has(row.provider))
             .map(row => row.provider))]
         } catch {}
         for (const provider of providers) {
           tasks.push(rpc('credits.claimAll', { provider }, 120_000).then(
             () => ({ ok: true, label: provider }),
-            error => ({ ok: false, label: provider, message: String(error?.message ?? error) })))
+            error => alreadyDone(error?.message)
+              ? { ok: true, label: provider }
+              : { ok: false, label: provider, message: String(error?.message ?? error) }))
         }
       }
       try {
@@ -532,7 +538,9 @@
           const label = `WorkBuddy ${account?.label ?? account?.id ?? ''}`.trim()
           tasks.push(api('/workbuddy/checkin', { id: account.id }).then(
             () => ({ ok: true, label }),
-            error => ({ ok: false, label, message: String(error?.message ?? error) })))
+            error => alreadyDone(error?.message)
+              ? { ok: true, label }
+              : { ok: false, label, message: String(error?.message ?? error) }))
         }
       } catch {}
       const settled = await Promise.all(tasks)
