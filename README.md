@@ -19,7 +19,7 @@ DSH 设置 → 积分汇通
 | --- | --- | --- |
 | WorkBuddy / CodeBuddy（腾讯） | 本插件**原生移植**，协议对齐开源 [workbuddy2api](https://github.com/linguo2625469/workbuddy2api-panel)（MIT） | 设备授权流登录、OpenAI 直通 + 出站修正、refresh 单飞（refreshToken 反重放）、错误分类（积分耗尽/限流/风控码）、积分余额与签到。**仅个人自用** |
 | Raccoon 商汤小浣熊 / Qoder / Qoder CN / ZCode / MiniMax / TRAE / Cline / Loomy / LobsterAI / Gemini | vendored `channel-pack`（MIT，上游 Jet/iJetLi，见 `vendor/channel-pack/NOTICE.md`） | 登录、账号池、积分领取。渠道模型由 **pack 桥接**（`pk/<provider>/<model>`）并入积分汇通目录，8330 网关与降级链均可直接使用；`accountPack: auto` 时若检测到已装 dsh-our-free-model 则自动跳过（其自带同源渠道包），避免双份注册与双重签到 |
-| 官方 API / 任意中转 | 本插件原生（openai-chat / anthropic-messages 双线格式） | 内置预设：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova；也支持任意 OpenAI 兼容中转站 |
+| 官方 API / 任意中转 | 本插件原生（openai-chat / anthropic-messages 双线格式） | 内置预设：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova、火山方舟（豆包）、百度千帆、魔搭 API-Inference；也支持任意 OpenAI 兼容中转站 |
 
 ## 网关接入
 
