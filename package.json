@@ -23,13 +23,27 @@
     "cordis.patch.yml",
     "LICENSE",
     "README.md",
-    "test"
+    "assets/banner.svg"
   ],
   "keywords": [
     "dsh",
     "dsh-plugin",
     "credit-hub",
-    "llm-provider"
+    "llm-provider",
+    "deepseek-harness",
+    "coding-agent",
+    "free-api",
+    "llm-proxy",
+    "openai-compatible",
+    "workbuddy",
+    "codebuddy",
+    "raccoon",
+    "qoder",
+    "trae",
+    "zcode",
+    "minimax",
+    "gemini",
+    "积分汇通"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

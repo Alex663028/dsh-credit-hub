@@ -1,25 +1,61 @@
-# dsh-credit-hub · 积分汇通
+<p align="center">
+  <img src="assets/banner.svg" alt="dsh-credit-hub · 积分汇通" width="720">
+</p>
 
-DeepSeek Harness（DSH）插件：把各家 coding agent 的**账号积分渠道**与**自填的官方 API / 中转**，
-汇成一条统一模型车道（`积分汇通`）和一个本地 **OpenAI + Anthropic 兼容网关**。
+<p align="center">
+  <b>把 10 个 coding agent 的免费积分，汇成一个本地 OpenAI + Anthropic 兼容网关</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Alex663028/dsh-credit-hub/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-176b75?style=flat-square" alt="MIT"></a>
+  <a href="#-渠道来源"><img src="https://img.shields.io/badge/渠道-10%2B%20账号积分-2b6cf0?style=flat-square" alt="10+ channels"></a>
+  <a href="#-功能"><img src="https://img.shields.io/badge/一键签到-✓-31b573?style=flat-square" alt="one-click check-in"></a>
+  <a href="#-网关接入"><img src="https://img.shields.io/badge/OpenAI%20%2B%20Anthropic-双兼容-9d5cff?style=flat-square" alt="dual protocol"></a>
+  <img src="https://img.shields.io/badge/Node.js-≥22.19-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node">
+  <img src="https://img.shields.io/badge/平台-Windows%20%2F%20macOS%20%2F%20Linux-8a93a8?style=flat-square" alt="platforms">
+</p>
+
+<p align="center">
+  DeepSeek Harness（DSH）插件 · 腾讯 CodeBuddy/WorkBuddy · 商汤小浣熊 · Qoder · TRAE · ZCode · MiniMax Code · Cline · Loomy · LobsterAI · Gemini
+</p>
+
+---
+
+## 这是什么
+
+`dsh-credit-hub`（积分汇通）把各家 coding agent 的**账号积分渠道**与**自填的官方 API / 中转**，
+汇成一条统一模型车道和一个本地 **OpenAI + Anthropic 兼容网关**（`127.0.0.1:8330`）。
+
+装好后，聊天框模型选择器里会出现「积分汇通」分组；外部工具（Cherry Studio、Codex、Claude Code、curl…）把网关地址一填即可用同一批免费额度。
 
 ```
 DSH 设置 → 积分汇通
-├─ 总览      汇通模型清单 / 各来源状态 / 开关
-├─ WorkBuddy 腾讯 CodeBuddy·WorkBuddy 原生渠道：设备流登录 / Token 导入 / 账号池 / 积分 / 签到
-├─ API 中转  预设 + 自定义上游（OpenAI 兼容 / Anthropic 兼容），填 Key 即接入
-├─ 降级链    把汇通目录里的模型串成链（fallback / round-robin），提交前失败自动换下一跳
+├─ 总览      汇通模型清单 / 各来源状态 / 一键签到 / 开关
+├─ 账号渠道   WorkBuddy 原生 + channel-pack 渠道：登录 / 账号池 / 积分
+├─ API 中转   预设 + 自定义上游（OpenAI 兼容 / Anthropic 兼容），填 Key 即接入
+├─ 降级链     把汇通目录里的模型串成链（fallback / round-robin），提交前失败自动换下一跳
 ├─ 网关      127.0.0.1:8330（可改端口），/v1/chat/completions + /v1/messages + /v1/models
 └─ 日志      逐条运行日志
 ```
+
+## ✨ 功能
+
+- **一键签到**：总览页一个按钮，并行领取全部在用渠道积分 + WorkBuddy 国内账号签到；「今天已签到」自动算成功，不报红。
+- **账号积分渠道 10+**：Raccoon 小浣熊、Qoder/QoderCN、TRAE、Cline、Loomy、MiniMax Code、ZCode、Gemini、LobsterAI、WorkBuddy/CodeBuddy——登录一次，长期使用。
+- **OpenCode 匿名免费车道**：`pk/opencode/*` 免费模型（DeepSeek V4.1 Flash Free、GLM 5.3 Flash Free 等）零成本汇入网关。
+- **API 中转预设 13 个**：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova、火山方舟（豆包）、百度千帆、魔搭 API-Inference。
+- **千帆 AK/SK 自动续期**：填 `AK:SK`，后台自动换 IAM access_token 并在到期前续期，无需手动刷新。
+- **降级链**：把模型串成链，失败自动 fallback / round-robin。
+- **本地网关**：OpenAI + Anthropic 双协议，模型 id 前缀 `wb/`、`up/`、`pk/`、`combo/`。
+- **安全设计**：日志脱敏、凭据 0600 + Windows ACL、管理面仅回环 + 同源。
 
 ## 渠道来源
 
 | 来源 | 实现方式 | 说明 |
 | --- | --- | --- |
 | WorkBuddy / CodeBuddy（腾讯） | 本插件**原生移植**，协议对齐开源 [workbuddy2api](https://github.com/linguo2625469/workbuddy2api-panel)（MIT） | 设备授权流登录、OpenAI 直通 + 出站修正、refresh 单飞（refreshToken 反重放）、错误分类（积分耗尽/限流/风控码）、积分余额与签到。**仅个人自用** |
-| Raccoon 商汤小浣熊 / Qoder / Qoder CN / ZCode / MiniMax / TRAE / Cline / Loomy / LobsterAI / Gemini | vendored `channel-pack`（MIT，上游 Jet/iJetLi，见 `vendor/channel-pack/NOTICE.md`） | 登录、账号池、积分领取。渠道模型由 **pack 桥接**（`pk/<provider>/<model>`）并入积分汇通目录，8330 网关与降级链均可直接使用；`accountPack: auto` 时若检测到已装 dsh-our-free-model 则自动跳过（其自带同源渠道包），避免双份注册与双重签到 |
-| 官方 API / 任意中转 | 本插件原生（openai-chat / anthropic-messages 双线格式） | 内置预设：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova、火山方舟（豆包）、百度千帆、魔搭 API-Inference；也支持任意 OpenAI 兼容中转站 |
+| Raccoon 商汤小浣熊 / Qoder / Qoder CN / ZCode / MiniMax / TRAE / Cline / Loomy / LobsterAI / Gemini / OpenCode | vendored `channel-pack`（MIT，上游 Jet/iJetLi，见 `vendor/channel-pack/NOTICE.md`） | 登录、账号池、积分领取。渠道模型由 **pack 桥接**（`pk/<provider>/<model>`）并入积分汇通目录，8330 网关与降级链均可直接使用；`accountPack: auto` 时若检测到已装 dsh-our-free-model 则自动跳过，避免双份注册与双重签到 |
+| 官方 API / 任意中转 | 本插件原生（openai-chat / anthropic-messages 双线格式） | 内置预设 13 个（含火山方舟、百度千帆、魔搭），也支持任意 OpenAI 兼容中转站 |
 
 ## 网关接入
 
@@ -61,6 +97,20 @@ POST /v1/messages
 
 ## 安装
 
+### 方式一：npm（推荐，开箱即用）
+
+```powershell
+# 在 {DSH_HOME}/profiles/desktop/package.json 的 dependencies 加入：
+#   "dsh-credit-hub": "^0.3.0"
+# 并把 "dsh-credit-hub" 加入 dsh.profile.bundles，然后：
+cd {DSH_HOME}/profiles/desktop
+pnpm install
+```
+
+重启 DSH，设置 → 积分汇通即出现。
+
+### 方式二：本地源码（开发 / 改源码即时生效）
+
 ```powershell
 git clone https://github.com/Alex663028/dsh-credit-hub.git
 ```
@@ -86,6 +136,12 @@ git clone https://github.com/Alex663028/dsh-credit-hub.git
   workbuddy2api 项目因此停更）。由此导致的账号风控/封禁由使用者自行承担。
 - refresh 单飞是硬约束：WorkBuddy 的 refreshToken 上游反重放，并发第二发会整条链作废（12153），
   本插件已按账号串行化，请勿同时跑多份指向同一账号的网关。
+
+## 相关话题（Topics）
+
+`dsh` · `deepseek-harness` · `coding-agent` · `free-api` · `llm-proxy` · `openai-compatible`
+`workbuddy` · `codebuddy` · `raccoon` · `qoder` · `trae` · `zcode` · `minimax` · `gemini`
+`积分汇通` · `免费模型` · `白嫖`
 
 ## 许可
 
