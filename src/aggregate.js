@@ -36,12 +36,39 @@ export const BUILTIN_PRESETS = [
   { id: 'anthropic', name: 'Anthropic 官方', baseURL: 'https://api.anthropic.com/v1', kind: 'anthropic-messages',
     models: [{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: 200000, maxOutput: 64000, reasoning: true }] },
   { id: 'sensenova', name: '商汤日日新 SenseNova', baseURL: 'https://api.sensenova.cn/compatible-mode/v1', kind: 'openai-chat', models: [] },
-  { id: 'ark', name: '火山方舟（豆包 Seed）', baseURL: 'https://ark.cn-beijing.volces.com/api/v3', kind: 'openai-chat', models: [] },
-  { id: 'qianfan', name: '百度千帆（文心/DeepSeek）', baseURL: 'https://qianfan.baidubce.com/v2', kind: 'openai-chat', models: [] },
-  { id: 'modelscope', name: '魔搭 API-Inference', baseURL: 'https://api-inference.modelscope.cn/v1', kind: 'openai-chat', models: [] },
+  { id: 'ark', name: '火山方舟（豆包 Seed）', baseURL: 'https://ark.cn-beijing.volces.com/api/v3', kind: 'openai-chat', models: [],
+    keyUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+  { id: 'qianfan', name: '百度千帆（文心/DeepSeek）', baseURL: 'https://qianfan.baidubce.com/v2', kind: 'openai-chat', models: [],
+    keyUrl: 'https://console.bce.baidu.com/iam/#/iam/accesskey' },
+  { id: 'modelscope', name: '魔搭 API-Inference', baseURL: 'https://api-inference.modelscope.cn/v1', kind: 'openai-chat', models: [],
+    keyUrl: 'https://modelscope.cn/my/myaccesstoken' },
 ]
 
 const fingerprint = key => typeof key === 'string' && key.length >= 8 ? `…${key.slice(-4)}` : undefined
+
+/** 百度千帆 IAM access_token 缓存：AK:SK → { token, expiresAt }，过期自动续。 */
+const qianfanTokenCache = new Map()
+
+async function qianfanAccessToken(entry) {
+  const raw = String(entry.apiKey ?? '')
+  const idx = raw.indexOf(':')
+  if (idx <= 0) throw new UpstreamError('千帆预设需要填 AK:SK（格式 AK:SK）', CODE.auth)
+  const ak = raw.slice(0, idx).trim()
+  const sk = raw.slice(idx + 1).trim()
+  if (!ak || !sk) throw new UpstreamError('千帆预设需要填 AK:SK（格式 AK:SK）', CODE.auth)
+  const cacheKey = `${ak}:${sk}`
+  const cached = qianfanTokenCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token
+  const url = `https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=${encodeURIComponent(ak)}&client_secret=${encodeURIComponent(sk)}`
+  const body = await getJson(url)
+  const token = body?.access_token
+  if (typeof token !== 'string' || token === '') {
+    throw new UpstreamError('千帆换取 access_token 失败，请检查 AK/SK', CODE.auth, { envelope: body })
+  }
+  const expiresIn = Number(body?.expires_in) > 0 ? Number(body.expires_in) : 2592000
+  qianfanTokenCache.set(cacheKey, { token, expiresAt: Date.now() + expiresIn * 1000 })
+  return token
+}
 
 export function createUpstreamRuntime({ stores, log }) {
   const read = () => {
@@ -123,7 +150,7 @@ export function createUpstreamRuntime({ stores, log }) {
     write(list)
   }
 
-  function headersOf(entry) {
+  async function headersOf(entry) {
     if (entry.kind === 'anthropic-messages') {
       return {
         'content-type': 'application/json',
@@ -132,10 +159,13 @@ export function createUpstreamRuntime({ stores, log }) {
         'anthropic-version': '2023-06-01',
       }
     }
+    const bearer = entry.id === 'preset-qianfan'
+      ? `Bearer ${await qianfanAccessToken(entry)}`
+      : `Bearer ${entry.apiKey ?? ''}`
     return {
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      authorization: `Bearer ${entry.apiKey ?? ''}`,
+      authorization: bearer,
     }
   }
 
@@ -145,7 +175,9 @@ export function createUpstreamRuntime({ stores, log }) {
     if (!entry) throw new UpstreamError('上游不存在', CODE.notFound)
     const headers = entry.kind === 'anthropic-messages'
       ? { 'x-api-key': entry.apiKey ?? '', 'anthropic-version': '2023-06-01' }
-      : { authorization: `Bearer ${entry.apiKey ?? ''}` }
+      : entry.id === 'preset-qianfan'
+        ? { authorization: `Bearer ${await qianfanAccessToken(entry)}` }
+        : { authorization: `Bearer ${entry.apiKey ?? ''}` }
     const body = await getJson(`${entry.baseURL}/models`, { headers })
     const rows = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : []
     const previous = new Map((entry.models ?? []).map(model => [model.id, model]))
@@ -256,7 +288,7 @@ export function createUpstreamRuntime({ stores, log }) {
       if (signal?.aborted) throw new UpstreamError('request aborted', CODE.transport)
       try {
         await postSse(url, {
-          headers: headersOf(entry),
+          headers: await headersOf(entry),
           body,
           signal,
           onEvent: data => { sawEvent = true; normalizer.feed(data) },
@@ -286,7 +318,7 @@ export function createUpstreamRuntime({ stores, log }) {
 
   return {
     channel: 'upstream',
-    presets: BUILTIN_PRESETS.map(({ id, name, kind, baseURL, models }) => ({ id, name, kind, baseURL, modelCount: models.length })),
+    presets: BUILTIN_PRESETS.map(({ id, name, kind, baseURL, models, keyUrl }) => ({ id, name, kind, baseURL, keyUrl, modelCount: models.length })),
     list: () => read().map(publicView),
     upsert,
     installPreset,

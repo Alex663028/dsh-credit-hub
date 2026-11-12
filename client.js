@@ -134,6 +134,7 @@
     'up.desc': '填 Key 即接入；所有上游模型都经本地网关提供给本机任意 agent',
     'up.keyPlaceholder': '粘贴 API Key…',
     'up.key': 'API Key',
+    'up.getKey': '获取 Key',
     'gw.portInvalid': '端口需为 1024-65535 的整数',
     'ov.usage': '用量（按模型）',
     'common.confirmRemove': '确定删除？',
@@ -283,6 +284,7 @@
     'up.desc': 'Paste a key to connect; all upstream models are served through the local gateway to any agent',
     'up.keyPlaceholder': 'Paste API key…',
     'up.key': 'API Key',
+    'up.getKey': 'Get key',
     'gw.portInvalid': 'Port must be an integer in 1024-65535',
     'ov.usage': 'Usage (per model)',
     'common.confirmRemove': 'Remove this entry?',
@@ -957,6 +959,9 @@
           await api('/upstreams/save', { id: `preset-${preset.id}`, name: preset.name, kind: preset.kind, baseURL: preset.baseURL, apiKey: key.trim(), enabled: true })
           setKey('')
           showToast(t('up.saved'))
+          // 保存成功后自动拉取模型列表（失败不阻断，让用户可手动重试）
+          const payload = await api('/upstreams/discover', { id: `preset-${preset.id}` }).catch(() => null)
+          if (payload) showToast(fmt('up.discovered', { n: payload.models?.length ?? 0 }))
           load(); onSaved?.()
         } catch (error) { showToast(String(error.message), 'warn') } finally { setBusy(false) }
       }
@@ -976,6 +981,7 @@
       },
         h('div', { className: 'ch-muted', style: { marginBottom: '8px' } }, preset.baseURL),
         h('div', { className: 'ch-row' },
+          preset.keyUrl ? h('a', { className: 'ch-btn ch-btn-sm', href: preset.keyUrl, target: '_blank', rel: 'noreferrer' }, t('up.getKey')) : null,
           h('input', { className: 'ch-input ch-grow', type: 'password', value: key, onChange: e => setKey(e.target.value), placeholder: t('up.keyPlaceholder') }),
           h(Btn, { kind: 'primary', small: true, busy, disabled: key.trim().length < 8, onClick: save }, t('up.save')),
           connected && h(Btn, { small: true, busy, onClick: discover }, t('up.discover'))),
