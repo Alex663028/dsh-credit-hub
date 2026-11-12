@@ -36,6 +36,9 @@ export const BUILTIN_PRESETS = [
   { id: 'anthropic', name: 'Anthropic 官方', baseURL: 'https://api.anthropic.com/v1', kind: 'anthropic-messages',
     models: [{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: 200000, maxOutput: 64000, reasoning: true }] },
   { id: 'sensenova', name: '商汤日日新 SenseNova', baseURL: 'https://api.sensenova.cn/compatible-mode/v1', kind: 'openai-chat', models: [] },
+  { id: 'ark', name: '火山方舟（豆包 Seed）', baseURL: 'https://ark.cn-beijing.volces.com/api/v3', kind: 'openai-chat', models: [] },
+  { id: 'qianfan', name: '百度千帆（文心/DeepSeek）', baseURL: 'https://qianfan.baidubce.com/v2', kind: 'openai-chat', models: [] },
+  { id: 'modelscope', name: '魔搭 API-Inference', baseURL: 'https://api-inference.modelscope.cn/v1', kind: 'openai-chat', models: [] },
 ]
 
 const fingerprint = key => typeof key === 'string' && key.length >= 8 ? `…${key.slice(-4)}` : undefined
