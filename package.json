@@ -23,6 +23,7 @@
     "cordis.patch.yml",
     "LICENSE",
     "README.md",
+    "install.ps1",
     "assets/banner.svg"
   ],
   "keywords": [

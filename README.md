@@ -97,19 +97,20 @@ POST /v1/messages
 
 ## 安装
 
-### 方式一：npm（推荐，开箱即用）
+> **尚未发布到 npm**，请用下面的源码方式安装。
+
+### 方式一：一键脚本（Windows，推荐）
 
 ```powershell
-# 在 {DSH_HOME}/profiles/desktop/package.json 的 dependencies 加入：
-#   "dsh-credit-hub": "^0.3.0"
-# 并把 "dsh-credit-hub" 加入 dsh.profile.bundles，然后：
-cd {DSH_HOME}/profiles/desktop
-pnpm install
+git clone https://github.com/Alex663028/dsh-credit-hub.git
+cd dsh-credit-hub
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-重启 DSH，设置 → 积分汇通即出现。
+脚本会：定位你的 DSH profile → 备份 `package.json` → 写入 `link:` 依赖与 `dsh.profile.bundles` → 执行 `pnpm install` → 提示重启 DSH。
+加 `-DryRun` 可只看将要做哪些改动，不落盘。
 
-### 方式二：本地源码（开发 / 改源码即时生效）
+### 方式二：手动安装（macOS / Linux / 想自己控制）
 
 ```powershell
 git clone https://github.com/Alex663028/dsh-credit-hub.git
