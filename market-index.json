@@ -1,0 +1,81 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Community plugin index",
+    "zh": "社区插件索引"
+  },
+  "description": {
+    "en": "Community-made plugins for DeepSeek Harness, installable straight from Git.",
+    "zh": "社区制作的 DeepSeek Harness 插件，直接从 Git 安装，无需 npm。"
+  },
+  "metadata": {
+    "categories": {
+      "llm": { "title": { "en": "LLM & Models", "zh": "模型与接入" } },
+      "productivity": { "title": { "en": "Productivity", "zh": "效率工具" } }
+    },
+    "labels": {
+      "free-credits": { "title": { "en": "Free credits", "zh": "免费积分" } },
+      "local-gateway": { "title": { "en": "Local gateway", "zh": "本地网关" } }
+    },
+    "sortKeys": {
+      "downloads": { "title": { "en": "Downloads", "zh": "下载量" }, "order": "desc" }
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-credit-hub",
+      "title": {
+        "en": "Credit Hub",
+        "zh": "积分汇通"
+      },
+      "description": {
+        "en": "Pool coding-agent free credits (WorkBuddy/CodeBuddy, SenseNova Raccoon, Qoder, TRAE, ZCode, MiniMax, Cline, Loomy, LobsterAI, Gemini, OpenCode) plus your own OpenAI/Anthropic-compatible upstreams into one model lane and a local gateway at 127.0.0.1:8330. One-click daily check-in, credit pools, fallback chains, usage dashboard.",
+        "zh": "把各家 coding agent 的免费积分（WorkBuddy/CodeBuddy、商汤小浣熊、Qoder、TRAE、ZCode、MiniMax、Cline、Loomy、LobsterAI、Gemini、OpenCode 匿名车道）与自填的官方 API / OpenAI 兼容中转，汇成一条统一模型车道和本地网关 127.0.0.1:8330。一键签到、账号池、降级链、用量看板。"
+      },
+      "icon": "./icon.svg",
+      "author": "Alex663028",
+      "homepage": "https://github.com/Alex663028/dsh-credit-hub#readme",
+      "repository": {
+        "url": "https://github.com/Alex663028/dsh-credit-hub"
+      },
+      "metadata": {
+        "category": "llm",
+        "keywords": [
+          "dsh",
+          "dsh-plugin",
+          "credit-hub",
+          "llm-provider",
+          "deepseek-harness",
+          "coding-agent",
+          "free-api",
+          "llm-proxy",
+          "openai-compatible",
+          "workbuddy",
+          "codebuddy",
+          "raccoon",
+          "qoder",
+          "trae",
+          "zcode",
+          "minimax",
+          "gemini"
+        ],
+        "labels": ["free-credits", "local-gateway"],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "0.3.0",
+          "publishTimestamp": 1794488344,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Alex663028/dsh-credit-hub",
+            "commit": "6fd8a27582f6de17efa9eced690fb18848c0a9da"
+          },
+          "engines": {
+            "dsh": "^0.2.2-rc.3 || >=0.2.2"
+          }
+        }
+      ]
+    }
+  ]
+}
