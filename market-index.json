@@ -10,15 +10,41 @@
   },
   "metadata": {
     "categories": {
-      "llm": { "title": { "en": "LLM & Models", "zh": "模型与接入" } },
-      "productivity": { "title": { "en": "Productivity", "zh": "效率工具" } }
+      "llm": {
+        "title": {
+          "en": "LLM & Models",
+          "zh": "模型与接入"
+        }
+      },
+      "productivity": {
+        "title": {
+          "en": "Productivity",
+          "zh": "效率工具"
+        }
+      }
     },
     "labels": {
-      "free-credits": { "title": { "en": "Free credits", "zh": "免费积分" } },
-      "local-gateway": { "title": { "en": "Local gateway", "zh": "本地网关" } }
+      "free-credits": {
+        "title": {
+          "en": "Free credits",
+          "zh": "免费积分"
+        }
+      },
+      "local-gateway": {
+        "title": {
+          "en": "Local gateway",
+          "zh": "本地网关"
+        }
+      }
     },
     "sortKeys": {
-      "downloads": { "title": { "en": "Downloads", "zh": "下载量" }, "order": "desc" }
+      "downloads": {
+        "title": {
+          "en": "Downloads",
+          "zh": "下载量"
+        },
+        "order": "desc"
+      }
     }
   },
   "plugins": [
@@ -59,10 +85,25 @@
           "minimax",
           "gemini"
         ],
-        "labels": ["free-credits", "local-gateway"],
+        "labels": [
+          "free-credits",
+          "local-gateway"
+        ],
         "sortKeys": {}
       },
       "versions": [
+        {
+          "version": "0.4.2",
+          "publishTimestamp": 1795273782,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Alex663028/dsh-credit-hub",
+            "commit": "f91a7d38522436504ea46eae78d3fa55d77447e3"
+          },
+          "engines": {
+            "dsh": "^0.2.2-rc.3 || >=0.2.2"
+          }
+        },
         {
           "version": "0.4.1",
           "publishTimestamp": 1795271607,
