@@ -1018,5 +1018,74 @@ await testAsync('non-qianfan preset stores AK:SK verbatim (no colon splitting)',
   await rmDir(dir)
 })
 
+// ── 结构化校验层（清单 #3） ────────────────────────────────────────────────
+await testAsync('management API returns 400 with field reasons for invalid input', async () => {
+  const { default: http } = await import('node:http')
+  const { createApiRoutes } = await import('../src/api.js')
+  const dir = tmpDir('ch-val-')
+  const stores = createStores(dir)
+  const api = createApiRoutes({
+    stores,
+    hub: { invalidate: () => {}, setCombos: async () => {}, combos: () => [] },
+    workbuddy: {},
+    upstreams: {
+      upsert: () => ({ id: 'up-x' }),
+      remove: () => {},
+      setEnabled: () => {},
+      list: () => [],
+    },
+    gateway: { running: false, stats: () => ({}) },
+    version: 'test', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    log: () => {}, warn: () => {},
+  })
+  const server = http.createServer(api)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  // 断言失败也要关掉 server，否则监听句柄把事件循环钉住、测试进程永不退出
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/credit-hub`
+    const post = (path, payload) => fetch(base + path, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    // baseURL 非法 → 400
+    const r1 = await post('/upstreams/save', { name: 'x', baseURL: 'ftp://bad', apiKey: 'k' })
+    assert.equal(r1.status, 400)
+    const p1 = await r1.json()
+    assert.match(p1.error, /baseURL/, 'error names the offending field')
+    // id 注入字符 → 400
+    const r2 = await post('/upstreams/remove', { id: '../etc/passwd' })
+    assert.equal(r2.status, 400)
+    // 合法请求仍然通过
+    const r3 = await post('/upstreams/save', { name: 'ok', baseURL: 'https://api.example.com/v1/', apiKey: 'k' })
+    assert.equal(r3.status, 200)
+    // combos：坏成员 → 400；空 combos 数组（清除全部）→ 200
+    const r4 = await post('/combos/save', { combos: [{ name: 'x', chain: ['bad id with space!'] }] })
+    assert.equal(r4.status, 400)
+    const r5 = await post('/combos/save', { combos: [] })
+    assert.equal(r5.status, 200)
+    // gateway key 带换行 → 400
+    const r6 = await post('/gateway/set-key', { key: 'abc\n123' })
+    assert.equal(r6.status, 400)
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('validate module: port / enum / idList / secret rules', async () => {
+  const { validate, rules, schemas } = await import('../src/validate.js')
+  assert.equal(validate({ gatewayPort: 8330 }, { gatewayPort: [rules.port('port', { optional: false })] }), null)
+  assert.match(validate({ gatewayPort: 80 }, { gatewayPort: [rules.port('port', { optional: false })] }).fields.gatewayPort, /1024/)
+  assert.equal(validate({ kind: 'openai-chat' }, { kind: [rules.enum('kind', ['openai-chat', 'anthropic-messages'])] }), null)
+  assert.match(validate({ kind: 'grpc' }, { kind: [rules.enum('kind', ['openai-chat'])] }).fields.kind, /openai-chat/)
+  assert.equal(validate({ ids: ['wb/m1', 'up/preset-ark/glm-4.6'] }, { ids: [rules.idList('ids', { optional: false })] }), null)
+  assert.ok(validate({ ids: ['has space'] }, { ids: [rules.idList('ids', { optional: false })] }))
+  // upstreamSave schema 端到端
+  assert.equal(validate({ name: 'n', baseURL: 'https://x/v1' }, schemas.upstreamSave), null)
+  const bad = validate({ name: 'n', baseURL: 'https://user:pass@x/v1' }, schemas.upstreamSave)
+  assert.match(bad.fields.baseURL, /凭据/)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 process.exitCode = failures === 0 ? 0 : 1

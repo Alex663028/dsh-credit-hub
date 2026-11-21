@@ -13,6 +13,7 @@ import { loadOrCreateApiKey } from './forward.js'
 import { packStateView, packStateFiles, ofmPresent } from './pack-mount.js'
 import { now } from './util.js'
 import { UpstreamError } from './http.js'
+import { assertValid, schemas, rules } from './validate.js'
 
 const MAX_BODY = 1024 * 1024
 const LOOPBACK_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i
@@ -126,6 +127,7 @@ export function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/models/toggle') {
         const body = await readJson(req)
+        assertValid(body, schemas.modelToggle)
         const id = String(body.id ?? '')
         if (!id) throw Object.assign(new Error('id required'), { statusCode: 400 })
         let disabled
@@ -190,18 +192,27 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/login') {
           const body = await readJson(req)
+          assertValid(body, schemas.workbuddyRealm)
           return send(200, await workbuddy.startLogin(body.realm === 'global' ? 'global' : 'cn'))
         }
         if (method === 'POST' && action === '/poll') {
           const body = await readJson(req)
+          assertValid(body, { loginId: [rules.string('loginId', { max: 120 })] })
           return send(200, await workbuddy.pollLogin(String(body.loginId ?? '')))
         }
         if (method === 'POST' && action === '/import') {
           const body = await readJson(req)
+          assertValid(body, {
+            accessToken: [rules.string('accessToken', { max: 4096 })],
+            refreshToken: [rules.secret('refreshToken', { max: 4096 })],
+            realm: [rules.enum('realm', ['cn', 'global'], { optional: true })],
+            label: [rules.string('label', { max: 80, optional: true })],
+          })
           return send(200, { account: workbuddy.importAccount(body) })
         }
         if (method === 'POST' && action === '/remove') {
           const body = await readJson(req)
+          assertValid(body, schemas.workbuddyAction)
           await workbuddy.remove(String(body.id ?? ''))
           hub.invalidate()
           deps.broadcast?.()
@@ -209,6 +220,7 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/enable') {
           const body = await readJson(req)
+          assertValid(body, schemas.workbuddyAction)
           await workbuddy.setEnabled(String(body.id ?? ''), body.enabled === true)
           hub.invalidate()
           deps.broadcast?.()
@@ -216,10 +228,12 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/credits') {
           const body = await readJson(req)
+          assertValid(body, schemas.workbuddyAction)
           return send(200, { credits: await workbuddy.fetchCredits(String(body.id ?? '')) })
         }
         if (method === 'POST' && action === '/checkin') {
           const body = await readJson(req)
+          assertValid(body, schemas.workbuddyAction)
           return send(200, await workbuddy.checkin(String(body.id ?? '')))
         }
         return send(404, { error: 'not found' })
@@ -232,6 +246,7 @@ export function createApiRoutes(deps) {
         if (method === 'GET' && action === '/presets') return send(200, { presets: upstreams.presets })
         if (method === 'POST' && action === '/save') {
           const body = await readJson(req)
+          assertValid(body, schemas.upstreamSave)
           const view = upstreams.upsert(body)
           hub.invalidate()
           deps.broadcast?.()
@@ -239,10 +254,12 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/install') {
           const body = await readJson(req)
+          assertValid(body, schemas.presetInstall)
           return send(200, { upstream: upstreams.installPreset(String(body.presetId ?? '')) })
         }
         if (method === 'POST' && action === '/remove') {
           const body = await readJson(req)
+          assertValid(body, schemas.upstreamAction)
           upstreams.remove(String(body.id ?? ''))
           hub.invalidate()
           deps.broadcast?.()
@@ -250,6 +267,7 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/enable') {
           const body = await readJson(req)
+          assertValid(body, schemas.upstreamAction)
           upstreams.setEnabled(String(body.id ?? ''), body.enabled === true)
           hub.invalidate()
           deps.broadcast?.()
@@ -257,6 +275,7 @@ export function createApiRoutes(deps) {
         }
         if (method === 'POST' && action === '/discover') {
           const body = await readJson(req)
+          assertValid(body, schemas.upstreamAction)
           const found = await upstreams.discover(String(body.id ?? ''))
           hub.invalidate()
           deps.broadcast?.()
@@ -269,6 +288,7 @@ export function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/combos') return send(200, { combos: hub.combos() })
       if (method === 'POST' && routePath === '/combos/save') {
         const body = await readJson(req)
+        assertValid(body, schemas.comboSave)
         const list = Array.isArray(body.combos) ? body.combos : []
         const clean = list.map(row => ({
           name: String(row.name ?? '').trim().slice(0, 60),
@@ -298,6 +318,7 @@ export function createApiRoutes(deps) {
       }
       if (method === 'POST' && routePath === '/gateway/set-key') {
         const body = await readJson(req)
+        assertValid(body, schemas.gatewaySetKey)
         const key = await gateway.setKey(String(body.key ?? ''))
         return send(200, { key })
       }
