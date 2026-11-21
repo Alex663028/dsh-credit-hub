@@ -345,7 +345,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       }
       const chain = comboChain(entry, rows)
       if (chain.length === 0) {
-        yield { type: 'finish', reason: { kind: 'error', failure: { message: `链路 "${entry.name}" 没有可用成员`, code: CODE.server } } }
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: `链路 "${entry.name}" 没有可用成员`, code: CODE.server, category: 'request', retryable: false } } }
         return
       }
       const startIndex = entry.strategy === 'round-robin'
@@ -410,7 +410,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         // 被跳过的成员失败也留痕，用量统计才完整
         recordTurn?.({ at: Date.now(), model: candidate.id, ok: false, skipped: true, error: failure?.message })
       }
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `链路 "${entry.name}" 全部候选失败：${tried.join('; ')}`, code: CODE.server } } }
+      yield { type: 'finish', reason: { kind: 'error', failure: { message: `链路 "${entry.name}" 全部候选失败：${tried.join('; ')}`, code: CODE.server, category: 'upstream', retryable: true } } }
     },
 
     async * runSingle(options, entry) {
@@ -419,7 +419,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         return
       }
       if (entry === null) {
-        yield { type: 'finish', reason: { kind: 'error', failure: { message: `积分汇通没有模型 "${options.model}"`, code: CODE.server } } }
+        yield { type: 'finish', reason: { kind: 'error', failure: { message: `积分汇通没有模型 "${options.model}"`, code: CODE.server, category: 'request', retryable: false } } }
         return
       }
       const startedAt = now()
@@ -501,6 +501,11 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
             failure: {
               message: String(failure?.message ?? 'credit-hub turn failed').slice(0, 500),
               code: typeof failure?.code === 'string' ? failure.code : CODE.transport,
+              // 统一错误模型（清单 #7）：category / retryable 随帧下发，
+              // 前端与降级链不再各自推断。
+              ...(failure?.category !== undefined ? { category: failure.category }
+                : { category: aborted ? 'aborted' : 'network' }),
+              retryable: failure?.retryable === true,
               ...(Number.isInteger(failure?.status) ? { status: failure.status } : {}),
             },
           },

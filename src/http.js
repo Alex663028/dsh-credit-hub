@@ -23,12 +23,36 @@ export const CODE = Object.freeze({
   region: 'REGION',
 })
 
+/**
+ * code → { category, retryable }（清单 #7 统一错误模型）。
+ *
+ * category：前端 / 日志 / 降级链共用的粗分类（auth/配置/限流/上游故障/网络）。
+ * retryable：降级链与重试层的唯一判据——「换下一跳还是直接失败」，不再散落
+ * 各处的 `status === 429 || code === 'RATE_LIMIT'` 字符串判断。
+ */
+const CODE_CLASS = Object.freeze({
+  [CODE.aborted]: { category: 'aborted', retryable: false },
+  [CODE.timeout]: { category: 'network', retryable: true },
+  [CODE.transport]: { category: 'network', retryable: true },
+  [CODE.server]: { category: 'upstream', retryable: true },
+  [CODE.client]: { category: 'request', retryable: false },
+  [CODE.auth]: { category: 'auth', retryable: false },
+  [CODE.rate]: { category: 'rate-limit', retryable: true },
+  [CODE.empty]: { category: 'upstream', retryable: true },
+  [CODE.notFound]: { category: 'request', retryable: false },
+  [CODE.region]: { category: 'region', retryable: false },
+})
+
 export class UpstreamError extends Error {
   constructor(message, code = CODE.transport, extra = undefined) {
     super(message)
     this.name = 'UpstreamError'
     this.code = code
+    const klass = CODE_CLASS[code] ?? { category: 'network', retryable: true }
+    this.category = klass.category
+    this.retryable = klass.retryable
     if (extra && typeof extra === 'object') Object.assign(this, extra)
+    // retryable 可被 extra 显式覆盖（如 503 但 Retry-After 表明可等）
   }
 }
 

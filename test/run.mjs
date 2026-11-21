@@ -1087,5 +1087,65 @@ await testAsync('validate module: port / enum / idList / secret rules', async ()
   assert.match(bad.fields.baseURL, /凭据/)
 })
 
+// ── 统一错误模型（清单 #7） ────────────────────────────────────────────────
+await testAsync('UpstreamError derives category/retryable from code; extra can override', async () => {
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const table = [
+    [CODE.auth, 'auth', false],
+    [CODE.rate, 'rate-limit', true],
+    [CODE.timeout, 'network', true],
+    [CODE.server, 'upstream', true],
+    [CODE.notFound, 'request', false],
+    [CODE.client, 'request', false],
+    [CODE.transport, 'network', true],
+    [CODE.aborted, 'aborted', false],
+    [CODE.empty, 'upstream', true],
+    [CODE.region, 'region', false],
+  ]
+  for (const [code, category, retryable] of table) {
+    const e = new UpstreamError('x', code)
+    assert.equal(e.category, category, `code ${code} → category`)
+    assert.equal(e.retryable, retryable, `code ${code} → retryable`)
+    assert.equal(e.code, code, 'code preserved (backward compat)')
+  }
+  // extra 可覆盖 retryable（如 503 + Retry-After 明确可等）
+  const e2 = new UpstreamError('x', CODE.server, { retryable: false, status: 503 })
+  assert.equal(e2.retryable, false, 'extra overrides derived retryable')
+  assert.equal(e2.category, 'upstream')
+  // 未知 code 兜底：按网络类可重试处理
+  const e3 = new UpstreamError('x', 'SOMETHING_NEW')
+  assert.equal(e3.category, 'network')
+  assert.equal(e3.retryable, true)
+})
+
+await testAsync('hub failure frame carries category/retryable in finish.reason.failure', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-errframe-')
+  const stores = createStores(dir)
+  const authFail = {
+    listModels: async () => [{ id: 'wb/bad', source: 'workbuddy', name: 'Bad', contextWindow: 128000, maxOutput: 8192 }],
+    // async throw（真实渠道形态）：dispatch 拿到 rejected promise，走 channel 错误帧路径
+    streamTurn: async () => { throw new UpstreamError('key expired', CODE.auth) },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: authFail, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  const chunks = []
+  const call = await hub.adapter.prepareCall('credit-hub', 'wb/bad')
+  for await (const chunk of call.stream({ model: 'wb/bad', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk)
+  const finish = chunks.find(c => c.type === 'finish')
+  assert.ok(finish, 'finish frame emitted')
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, 'AUTH')
+  assert.equal(finish.reason.failure.category, 'auth', 'failure frame carries category')
+  assert.equal(finish.reason.failure.retryable, false, 'failure frame carries retryable')
+  stores.dispose()
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 process.exitCode = failures === 0 ? 0 : 1
