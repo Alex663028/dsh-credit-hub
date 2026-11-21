@@ -112,6 +112,8 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
   let catalogCache
   let catalogAt = 0
   let lastDegraded = -1
+  // 目录来源状态（诊断闭环）：最近一轮 catalog 各来源的降级原因；成功轮清除。
+  const sourceDegrades = new Map()
   // 并发共享的同一次目录计算。宿主一次 catalog 要几秒（WorkBuddy /v3/config +
   // 逐 provider listModels），期间模型选择器、8330 的 /v1/models、设置页 API
   // 都会并发进来；旧写法直接返回空清单，宿主把空结果缓存进选择器，45s 内不
@@ -138,25 +140,35 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     const job = (async () => {
       const entries = []
       let degraded = 0
+      const degrades = new Map()
       try { entries.push(...await workbuddy.listModels()) } catch (error) {
         degraded += 1
+        degrades.set('workbuddy', error?.message ?? String(error))
         warn?.(`credit-hub: [来源 1/3 workbuddy] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
       }
       try { entries.push(...await upstreams.listModels()) } catch (error) {
         degraded += 1
+        degrades.set('upstream', error?.message ?? String(error))
         warn?.(`credit-hub: [来源 2/3 upstreams] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
       }
       if (packBridge) {
         try { entries.push(...await packBridge.listModels()) } catch (error) {
           degraded += 1
+          degrades.set('pack', error?.message ?? String(error))
           warn?.(`credit-hub: [来源 3/3 packBridge] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
         }
       } else if (packModels) {
         try { entries.push(...await packModels()) } catch (error) {
           degraded += 1
+          degrades.set('pack', error?.message ?? String(error))
           warn?.(`credit-hub: [来源 3/3 packModels] 模型清单失败，本轮跳过该来源（${error?.message ?? error}）`)
         }
       }
+      // 目录来源状态（诊断闭环）：成功时清除该来源的降级记录
+      for (const okSource of ['workbuddy', 'upstream', 'pack']) {
+        if (!degrades.has(okSource)) sourceDegrades.delete(okSource)
+      }
+      for (const [k, v] of degrades.entries()) sourceDegrades.set(k, v)
       // 降级数变化时汇总一条：目录少了一半模型时不再只靠用户自己发现
       if (degraded !== lastDegraded) {
         lastDegraded = degraded
@@ -365,10 +377,15 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       let advancedCount = 0
       for (let index = 0; index < chain.length; index += 1) {
         const candidate = chain[(startIndex + index) % chain.length]
-        // 熔断冷却中的成员直接跳过（半开例外：放行一次试探）
-        const cooldown = breaker.canTry(candidate.id)
+        // 熔断键（清单：防状态分裂）：provider + upstreamId 维度共享——
+        // 同一上游（账号）的不同模型共享健康度，pack 桥接与独立车道无法
+        // 各持一份互相矛盾的熔断状态。取消类失败不该算服务故障。
+        const breakerKey = candidate.upstreamId ?? candidate.id
+        // 熔断冷却中的成员直接跳过；canTry 返回 null = 放行（含半开探测那一次）
+        const cooldown = breaker.canTry(breakerKey)
         if (cooldown !== null) {
-          tried.push(`${candidate.id} (冷却中，剩 ${Math.ceil(cooldown / 1000)}s)`)
+          const note = cooldown > 0 ? `冷却中，剩 ${Math.ceil(cooldown / 1000)}s` : '半开探测在途'
+          tried.push(`${candidate.id} (${note})`)
           advancedCount += 1
           continue
         }
@@ -423,7 +440,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
           yield { type: 'usage', usage: outcome.usage ?? { inputTokens: 0, outputTokens: 0 } }
           const kind = outcome.finish === 'max_tokens' || outcome.finish === 'length' ? 'max-tokens' : 'stop'
           yield { type: 'finish', reason: { kind } }
-          breaker.recordSuccess(candidate.id)
+          breaker.recordSuccess(breakerKey)
           recordTurn?.({
             at: Date.now(), model: candidate.id, ok: true, usage: outcome.usage,
             traceId, ttfbMs: candidateFirstByteMs, totalMs: now() - candidateStartedAt,
@@ -432,9 +449,19 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
           return
         }
         const failure = endValue?.value?.error
-        // 非重试类失败（auth/配置错）不熔断也不该换跳浪费时间——但为保兼容
-        // 仍走 advance（现有语义）；熔断只记可重试类失败。
-        if (failure?.retryable !== false) breaker.recordFailure(candidate.id, failure?.message)
+        // 取消/外部 abort 不是服务故障：不进熔断，也不留痕为失败（用户主动停）。
+        if (failure?.code === CODE.aborted || options.signal?.aborted === true) {
+          tried.push(`${candidate.id} (取消)`)
+          continue
+        }
+        // 非重试类失败（auth/配置错）不熔断——换跳也救不了凭据问题；
+        // 熔断只记可重试类失败，429 的 Retry-After 覆盖冷却时长。
+        if (failure?.retryable !== false) {
+          breaker.recordFailure(breakerKey, failure?.message, {
+            category: failure?.category,
+            retryAfterMs: failure?.retryAfterMs,
+          })
+        }
         tried.push(`${candidate.id}${failure ? ` (${String(failure?.message ?? 'failed').slice(0, 80)})` : ''}`)
         warn?.(`credit-hub: [${traceId}] 链路 "${entry.name}" 跳过 ${candidate.id}${failure ? ` — ${failure.message ?? ''}` : ''}`)
         // 被跳过的成员失败也留痕，用量统计才完整
@@ -573,6 +600,31 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     combos,
     /** 成员熔断快照（管理面/调试用）。 */
     breaker: () => breaker.snapshot(),
+    /** 手动重置熔断（管理面单独暴露，POST + 前端二次确认）。 */
+    resetBreaker: ids => breaker.reset(ids),
+    /** 目录来源状态（清单：诊断闭环）——总览页按来源显示异常而非笼统零模型。 */
+    sourceStatus() {
+      const out = {}
+      const degrade = sourceDegrades.get('workbuddy') ?? null
+      out.workbuddy = {
+        ok: degrade === null,
+        count: catalogCache?.filter(row => row.source === 'workbuddy').length ?? 0,
+        ...(degrade ? { error: String(degrade).slice(0, 200) } : {}),
+      }
+      const up = sourceDegrades.get('upstream') ?? null
+      out.upstreams = {
+        ok: up === null,
+        count: catalogCache?.filter(row => row.source === 'upstream').length ?? 0,
+        ...(up ? { error: String(up).slice(0, 200) } : {}),
+      }
+      const pk = sourceDegrades.get('pack') ?? null
+      out.pack = {
+        ok: pk === null,
+        count: catalogCache?.filter(row => row.source === 'pack').length ?? 0,
+        ...(pk ? { error: String(pk).slice(0, 200) } : {}),
+      }
+      return out
+    },
     async setCombos(list) {
       stores.routes.update(data => ({ ...data, combos: list }))
       invalidate()

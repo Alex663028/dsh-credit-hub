@@ -105,6 +105,7 @@ export function createApiRoutes(deps) {
           gateway: { running: gateway.running, bind: gateway.running ? gateway.bind() : null, stats: gateway.stats() },
           usage: typeof deps.usage === 'function' ? deps.usage() : [],
           breaker: typeof hub.breaker === 'function' ? hub.breaker() : {},
+          sources: typeof hub.sourceStatus === 'function' ? hub.sourceStatus() : {},
           modelCount: (await hub.catalog()).length,
         })
       }
@@ -299,6 +300,20 @@ export function createApiRoutes(deps) {
         await hub.setCombos(clean)
         deps.broadcast?.()
         return send(200, { combos: hub.combos() })
+      }
+
+      // ── 熔断器诊断（清单：可观测 + 手动恢复） ──────────────────────────────
+      if (method === 'GET' && routePath === '/breaker') {
+        return send(200, { breaker: typeof hub.breaker === 'function' ? hub.breaker() : {} })
+      }
+      // 手动重置单独暴露为 POST + confirm 语义（前端二次确认），避免误操作
+      // 影响在线流量：重置会把冷却中的成员立即放回轮转。
+      if (method === 'POST' && routePath === '/breaker/reset') {
+        const body = await readJson(req)
+        if (typeof hub.resetBreaker !== 'function') return send(404, { error: 'not supported' })
+        hub.resetBreaker(Array.isArray(body.ids) ? body.ids.filter(row => typeof row === 'string') : undefined)
+        deps.broadcast?.()
+        return send(200, { breaker: hub.breaker() })
       }
 
       // ── gateway ────────────────────────────────────────────────────────────

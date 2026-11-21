@@ -1167,15 +1167,15 @@ test('breaker opens after threshold failures with exponential cooldown, half-ope
     // 第 3 次 → 熔断
     const cd1 = b.recordFailure('m', 'err3')
     assert.ok(cd1 >= 1000, `third failure trips breaker (${cd1}ms)`)
-    // 半开：下一次放行
-    assert.equal(b.canTry('m'), null, 'half-open admits one probe')
-    assert.ok(Number.isFinite(b.canTry('m')) && b.canTry('m') > 0, 'subsequent checks still blocked')
+    // 冷却期内一律拒绝（不再有"第一个请求直接放行"的旧 bug）
+    assert.ok(Number.isFinite(b.canTry('m')) && b.canTry('m') > 0, 'cooling down: blocked')
+    assert.ok(Number.isFinite(b.canTry('m')) && b.canTry('m') > 0, 'still blocked on second check')
     // 试探成功 → 关闭
     b.recordSuccess('m')
     assert.equal(b.canTry('m'), null, 'closed after success')
     const snap = b.snapshot()['m']
     assert.equal(snap.state, 'closed')
-    assert.equal(snap.fails, 0)
+    assert.equal(snap.consecutiveFails, 0)
     // 再熔断 → 冷却翻倍
     for (let i = 0; i < 3; i++) b.recordFailure('m', 'again')
     const cd2 = b.recordFailure('m', 'again')
@@ -1233,6 +1233,194 @@ await testAsync('gateway emits x-credit-hub-trace header and honors client x-req
   const serverTrace = r2.headers.get('x-credit-hub-trace')
   assert.ok(serverTrace?.startsWith('trc_'), `server mints trace id (${serverTrace})`)
   await gateway.stop()
+  stores.dispose()
+  await rmDir(dir)
+})
+
+// ── 熔断器确定性时钟测试（优先级一：不依赖真实等待） ────────────────────────
+test('breaker deterministic clock: open→skip, half-open probe, recovery, re-trip', () => {
+  return (async () => {
+    const { createBreaker } = await import('../src/breaker.js')
+    let t = 1_000_000
+    const b = createBreaker({ threshold: 3, baseCooldownMs: 1000, maxCooldownMs: 60_000, now: () => t })
+
+    // 1. 打开前可用；连续失败 3 次 → 熔断
+    assert.equal(b.canTry('m'), null)
+    b.recordFailure('m', 'e1', { category: 'rate-limit' })
+    b.recordFailure('m', 'e2', { category: 'rate-limit' })
+    assert.equal(b.recordFailure('m', 'e3', { category: 'rate-limit' }), 1000, 'trips at threshold')
+    const snap0 = b.snapshot()['m']
+    assert.equal(snap0.state, 'open')
+    assert.equal(snap0.consecutiveFails, 3)
+    assert.equal(snap0.cooldownRemainingMs, 1000)
+    assert.equal(snap0.lastCategory, 'rate-limit')
+
+    // 2. 冷却期内跳过
+    t += 500
+    assert.equal(b.canTry('m'), 500, 'still cooling')
+
+    // 3. 冷却期满 → 半开只放行一个探测；并发后续调用者拿到 0（探测在途，继续跳过）
+    t += 600
+    assert.equal(b.canTry('m'), null, 'half-open admits first probe')
+    assert.equal(b.canTry('m'), 0, 'second concurrent caller blocked (probe in flight)')
+    assert.equal(b.canTry('m'), 0, 'third concurrent caller blocked (probe in flight)')
+
+    // 4. 探测成功 → 恢复（closed + 计数清零 + 恢复时刻记录）
+    b.recordSuccess('m')
+    const snap1 = b.snapshot()['m']
+    assert.equal(snap1.state, 'closed')
+    assert.equal(snap1.consecutiveFails, 0)
+    assert.equal(snap1.probes, 1)
+    assert.equal(snap1.lastRecoveredAt, t)
+
+    // 5. 恢复后全新一轮故障 → 冷却从 base 重新开始（openLevel 已随恢复清零；
+    //    「翻倍」只适用于半开探测失败——未恢复就再挂，见 5b）
+    b.recordFailure('m', 'x'); b.recordFailure('m', 'x')
+    const cd2 = b.recordFailure('m', 'x')
+    assert.equal(cd2, 1000, 'fresh round after recovery starts at base cooldown')
+    // 5b. 半开探测失败 → 未恢复再挂，档位递增
+    t += 1100
+    assert.equal(b.canTry('m'), null, 'half-open probe admitted')
+    const cd2b = b.recordFailure('m', 'probe-failed')
+    assert.ok(cd2b >= 2000, `probe failure re-trips with escalated cooldown (${cd2b}ms)`)
+    // 6. 冷却期内再失败 → 档位递增
+    t += 2500
+    b.recordFailure('m', 'x'); b.recordFailure('m', 'x')
+    const cd3 = b.recordFailure('m', 'x', { retryAfterMs: 8000 })
+    assert.equal(cd3, 8000, 'Retry-After overrides exponential backoff')
+
+    // 7. Retry-After 不缩短（小于 base 时取 base）且封顶 max
+    t += 9000
+    b.recordFailure('m', 'x'); b.recordFailure('m', 'x')
+    const cd4 = b.recordFailure('m', 'x', { retryAfterMs: 100 })
+    assert.equal(cd4, 1000, 'retryAfter < base → base wins')
+    // 8. 手动重置
+    b.reset(['m'])
+    assert.equal(b.canTry('m'), null, 'manual reset releases cooldown')
+    assert.equal(b.snapshot()['m'].consecutiveFails, 0)
+    // 9. 不同成员状态独立
+    b.recordFailure('other', 'y'); b.recordFailure('other', 'y'); b.recordFailure('other', 'y')
+    assert.equal(b.snapshot()['m'].state, 'closed', 'm unaffected')
+    assert.equal(b.snapshot().other.state, 'open', 'other tripped independently')
+  })()
+})
+
+await testAsync('combo chain: cancels and auth errors do not trip breaker; skip note lists cooldown', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-brk2-')
+  const stores = createStores(dir)
+  let behavior = 'auth'
+  const flaky = {
+    listModels: async () => [{ id: 'wb/fl', source: 'workbuddy', name: 'FL', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async () => {
+      if (behavior === 'auth') throw new UpstreamError('bad key', CODE.auth)
+      if (behavior === 'cancel') throw new UpstreamError('user stopped', CODE.aborted)
+      throw new UpstreamError('rate limited', CODE.rate)
+    },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const healthy = makeSource('up')
+  const hub = createHubRuntime({
+    stores, workbuddy: flaky, upstreams: healthy, logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.setCombos([{ name: 'x', strategy: 'fallback', chain: ['wb/fl', 'up/m1'] }])
+  const runOnce = async () => {
+    const chunks = []
+    const call = await hub.adapter.prepareCall('credit-hub', 'combo/x')
+    for await (const chunk of call.stream({ model: 'combo/x', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk)
+    return chunks
+  }
+  // auth 失败多次 → 不熔断（retryable=false）：行存在（canTry 会建行）但保持 closed
+  behavior = 'auth'
+  for (let i = 0; i < 5; i++) await runOnce()
+  const authSnap = hub.breaker()['wb/fl']
+  assert.ok(authSnap === undefined || (authSnap.state === 'closed' && authSnap.consecutiveFails === 0),
+    `auth errors never trip breaker (${JSON.stringify(authSnap)})`)
+  // cancel 多次 → 不熔断
+  behavior = 'cancel'
+  for (let i = 0; i < 5; i++) await runOnce()
+  const cancelSnap = hub.breaker()['wb/fl']
+  assert.ok(cancelSnap === undefined || (cancelSnap.state === 'closed' && cancelSnap.consecutiveFails === 0),
+    `aborts never trip breaker (${JSON.stringify(cancelSnap)})`)
+  // rate-limit 连续 3 次 → 熔断，第 4 轮 tried 里出现冷却标注，健康成员兜底
+  behavior = 'rate'
+  for (let i = 0; i < 3; i++) await runOnce()
+  const snap = hub.breaker()['wb/fl']
+  assert.equal(snap.state, 'open', 'rate-limit trips after 3')
+  assert.equal(snap.lastCategory, 'rate-limit')
+  const chunks4 = await runOnce()
+  assert.ok(chunks4.some(c => c.type === 'finish' && c.reason.kind === 'stop'), 'healthy member still serves')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('breaker diagnostics API: GET /breaker view + POST /breaker/reset releases', async () => {
+  const { default: http } = await import('node:http')
+  const { createApiRoutes } = await import('../src/api.js')
+  const dir = tmpDir('ch-brkapi-')
+  const stores = createStores(dir)
+  const fakeBreaker = {
+    state: new Map([['wb/x', { state: 'open', consecutiveFails: 3, cooldownRemainingMs: 25000, probes: 1, lastCategory: 'rate-limit', lastError: 'too many' }]]),
+    snapshot() { return Object.fromEntries(this.state) },
+    reset(ids) { if (!ids || ids.includes('wb/x')) this.state.delete('wb/x') },
+  }
+  const api = createApiRoutes({
+    stores,
+    hub: { invalidate: () => {}, breaker: () => fakeBreaker.snapshot(), resetBreaker: ids => fakeBreaker.reset(ids) },
+    workbuddy: {}, upstreams: {},
+    gateway: { running: false, stats: () => ({}) },
+    version: 'test', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    log: () => {}, warn: () => {},
+  })
+  const server = http.createServer(api)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/credit-hub`
+    // GET 视图含状态/连续失败/剩余/分类/探测次数
+    const view = await (await fetch(`${base}/breaker`)).json()
+    const row = view.breaker['wb/x']
+    assert.equal(row.state, 'open')
+    assert.equal(row.consecutiveFails, 3)
+    assert.equal(row.cooldownRemainingMs, 25000)
+    assert.equal(row.probes, 1)
+    assert.equal(row.lastCategory, 'rate-limit')
+    // POST 重置（带 confirm 头语义的单独端点）→ 冷却解除
+    const reset = await fetch(`${base}/breaker/reset`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids: ['wb/x'] }) })
+    assert.equal(reset.status, 200)
+    const after = await (await fetch(`${base}/breaker`)).json()
+    assert.equal(after.breaker['wb/x'], undefined, 'cooldown released')
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('hub sourceStatus reports per-source ok/count/error', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-src-')
+  const stores = createStores(dir)
+  const broken = {
+    listModels: async () => { throw new Error('login expired') },
+    streamTurn: async () => { throw new Error('x') },
+    status: () => ({ accounts: 0, ok: 0 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: broken, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.catalog(true)
+  const st = hub.sourceStatus()
+  assert.equal(st.workbuddy.ok, false)
+  assert.match(st.workbuddy.error, /login expired/)
+  assert.equal(st.upstreams.ok, true)
+  assert.ok(st.upstreams.count >= 1)
+  assert.equal(st.pack.ok, true)
+  assert.equal(st.pack.count, 0)
   stores.dispose()
   await rmDir(dir)
 })
