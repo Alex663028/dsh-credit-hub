@@ -1288,6 +1288,49 @@
     }
 
     // ── 降级链 ─────────────────────────────────────────────────────────────────
+    /** 熔断器状态卡（优先级二）：状态/连续失败/冷却剩余/失败分类/探测次数 + 手动重置。 */
+    function BreakerCard({ showToast }) {
+      const [rows, setRows] = useState(null)
+      const [confirming, setConfirming] = useState(false)
+      const load = useCallback(() => { void api('/breaker').then(payload => setRows(payload.breaker ?? {})).catch(() => {}) }, [])
+      usePoll(load, 10_000)
+
+      const labels = {
+        closed: { text: '正常', accent: '#31b573' },
+        open: { text: '已熔断', accent: '#e05252' },
+        'half-open': { text: '半开恢复中', accent: '#e0a13d' },
+      }
+      const resetAll = async () => {
+        try { await api('/breaker/reset', { ids: [] }); showToast('熔断状态已重置'); load() } catch (error) { showToast(String(error.message), 'warn') }
+      }
+      const entries = Object.entries(rows ?? {})
+      return h(Card, { title: `成员健康度 · ${entries.filter(([, r]) => r.state !== 'closed').length} 个非正常`, accent: '#e05252' },
+        entries.length === 0 ? h('div', { className: 'ch-muted' }, '所有成员正常（无熔断记录）')
+          : h('div', { className: 'ch-rows' }, entries.map(([id, row]) => {
+            const meta = labels[row.state] ?? { text: row.state, accent: '#8a93a8' }
+            return h('div', { className: 'ch-rowline', key: id },
+              h('div', { className: 'ch-rowline-main' },
+                h('span', { className: 'ch-accent', style: { background: meta.accent } }),
+                h('b', null, id),
+                h('span', { style: { color: meta.accent, fontWeight: 600 } }, meta.text),
+                h(Muted, null, `连续失败 ${row.consecutiveFails ?? 0}`),
+                row.cooldownRemainingMs ? h(Muted, null, `冷却剩 ${Math.ceil(row.cooldownRemainingMs / 1000)}s`) : null,
+                row.probes ? h(Muted, null, `探测 ${row.probes} 次`) : null,
+                row.lastCategory ? h('span', { className: 'ch-error' }, row.lastCategory) : null,
+                row.lastError ? h('span', { className: 'ch-error', title: row.lastError }, '⚠') : null),
+              h('div', { className: 'ch-rowline-actions' },
+                row.state !== 'closed' ? h(Btn, { small: true, onClick: async () => {
+                  try { await api('/breaker/reset', { ids: [id] }); showToast(`${id} 已重置`); load() } catch (error) { showToast(String(error.message), 'warn') }
+                } }, '手动恢复') : null))
+          })),
+        entries.length > 0 ? h('div', { className: 'ch-row', style: { marginTop: '8px' } },
+          confirming
+            ? [h(Muted, { key: 'q' }, '确认重置全部熔断？冷却中的成员会立即回到轮转。'),
+               h(Btn, { key: 'y', small: true, kind: 'danger', onClick: () => { setConfirming(false); resetAll() } }, '确认'),
+               h(Btn, { key: 'n', small: true, onClick: () => setConfirming(false) }, '取消')]
+            : h(Btn, { small: true, onClick: () => setConfirming(true) }, '重置全部')) : null)
+    }
+
     function CombosPage() {
       const [rows, setRows] = useState(null)
       const [models, setModels] = useState([])
@@ -1362,6 +1405,7 @@
         h(Notice, { text: t('combo.scope') }),
         builder,
         listCard,
+        h(BreakerCard, { showToast }),
         h(Toast, { toast }))
     }
 
