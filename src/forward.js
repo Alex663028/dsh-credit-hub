@@ -105,6 +105,9 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     res.end(JSON.stringify(payload))
   }
 
+  /** 每请求 trace-id（清单 #11）：响应头可查，日志关联。客户端自带的 x-request-id 优先。 */
+  const traceOf = req => String(req.headers['x-request-id'] ?? '').replace(/[^\w.-]/g, '').slice(0, 64) || mintId('trc')
+
   const authorized = req => {
     // codex 系代理送 Key 的姿势五花八门：Authorization: Bearer、x-api-key、
     // api-key、双 Bearer 前缀、?key= 查询参数——全部兼容，值匹配即放行
@@ -705,6 +708,9 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配）` })
           return send(res, 401, { error: { message: 'invalid gateway key — 请把网关页显示的 Key 填入 Authorization: Bearer 或 x-api-key 请求头', type: 'auth_error' } })
         }
+        // trace 头统一在此下发：所有路由（GET/POST）都可由响应头回查 trace-id
+        const requestTraceId = traceOf(req)
+        res.setHeader('x-credit-hub-trace', requestTraceId)
         if (req.method === 'POST' && routePath.startsWith('/v1/')) {
           // 请求体预览落日志：调用方接入排查的第一现场
           rawBody = await readBody(req)
@@ -730,6 +736,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         }
         if (req.method === 'POST' && (routePath === '/v1/responses' || routePath === '/responses')) {
           const body = JSON.parse(rawBody || '{}')
+          const traceId = requestTraceId
           const tools = responsesToolsToHarness(body.tools)
           const options = {
             model: String(body.model ?? ''),
@@ -740,6 +747,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
             ...(tools.length > 0 ? { tools } : {}),
             ...(body.reasoning?.effort !== undefined ? { reasoningEffort: body.reasoning.effort } : {}),
             sessionId: '',
+            traceId,
           }
           const signal = new AbortController()
           res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
@@ -752,7 +760,8 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         }
         if (req.method === 'POST' && (routePath === '/v1/chat/completions' || routePath === '/chat/completions')) {
           const body = JSON.parse(rawBody || '{}')
-          const options = harnessOptions(body, openAiToHarness(body.messages), 'openai')
+          const traceId = requestTraceId
+          const options = { ...harnessOptions(body, openAiToHarness(body.messages), 'openai'), traceId }
           const signal = new AbortController()
           // Abort on the *response* closing early — req 'close' also fires once
           // the body has been consumed, which would kill healthy turns.
@@ -768,7 +777,8 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         }
         if (req.method === 'POST' && (routePath === '/v1/messages' || routePath === '/messages')) {
           const body = JSON.parse(rawBody || '{}')
-          const options = harnessOptions(body, claudeToHarness(body), 'claude')
+          const traceId = requestTraceId
+          const options = { ...harnessOptions(body, claudeToHarness(body), 'claude'), traceId }
           const signal = new AbortController()
           res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
           const result = body.stream === true

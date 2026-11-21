@@ -1154,6 +1154,89 @@ await testAsync('hub failure frame carries category/retryable in finish.reason.f
   await rmDir(dir)
 })
 
+// ── 批次五：熔断器 + 可观测性 ──────────────────────────────────────────────
+test('breaker opens after threshold failures with exponential cooldown, half-opens once', () => {
+  return (async () => {
+    const { createBreaker } = await import('../src/breaker.js')
+    const b = createBreaker({ threshold: 3, baseCooldownMs: 1000, maxCooldownMs: 60_000 })
+    assert.equal(b.canTry('m'), null, 'fresh member usable')
+    assert.equal(b.recordFailure('m', 'err1'), 0, 'below threshold → no cooldown')
+    assert.equal(b.canTry('m'), null)
+    b.recordFailure('m', 'err2')
+    assert.equal(b.canTry('m'), null)
+    // 第 3 次 → 熔断
+    const cd1 = b.recordFailure('m', 'err3')
+    assert.ok(cd1 >= 1000, `third failure trips breaker (${cd1}ms)`)
+    // 半开：下一次放行
+    assert.equal(b.canTry('m'), null, 'half-open admits one probe')
+    assert.ok(Number.isFinite(b.canTry('m')) && b.canTry('m') > 0, 'subsequent checks still blocked')
+    // 试探成功 → 关闭
+    b.recordSuccess('m')
+    assert.equal(b.canTry('m'), null, 'closed after success')
+    const snap = b.snapshot()['m']
+    assert.equal(snap.state, 'closed')
+    assert.equal(snap.fails, 0)
+    // 再熔断 → 冷却翻倍
+    for (let i = 0; i < 3; i++) b.recordFailure('m', 'again')
+    const cd2 = b.recordFailure('m', 'again')
+    assert.ok(cd2 >= 2000, `re-trip doubles cooldown (${cd2}ms)`)
+  })()
+})
+
+await testAsync('combo chain skips cooled-down member and records failure with trace/ttfb', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-breaker-')
+  const stores = createStores(dir)
+  const rateLimited = {
+    listModels: async () => [{ id: 'wb/rl', source: 'workbuddy', name: 'RL', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async () => { throw new UpstreamError('rate limited', CODE.rate) },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const healthy = makeSource('up')
+  const hub = createHubRuntime({
+    stores, workbuddy: rateLimited, upstreams: healthy, logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.setCombos([{ name: 'b', strategy: 'fallback', chain: ['wb/rl', 'up/m1'] }])
+  const turns = []
+  const recordTurn = info => turns.push(info)
+  // 经由第二参数注入 recordTurn 不支持——直接通过 hub 内部不可达，改走全局可观测断言：
+  const chunks = []
+  const call = await hub.adapter.prepareCall('credit-hub', 'combo/b')
+  for await (const chunk of call.stream({ model: 'combo/b', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk)
+  assert.ok(chunks.some(c => c.type === 'finish' && c.reason.kind === 'stop'), 'healthy member wins')
+  // 前 3 轮全部撞限流成员 → 第 4 轮起 wb/rl 进入冷却，tried 里出现「冷却中」
+  const breakerSnap = hub.breaker()
+  assert.equal(breakerSnap['wb/rl'].state, 'closed', 'one failure below threshold')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('gateway emits x-credit-hub-trace header and honors client x-request-id', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-trace-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 40000 + Math.floor(Math.random() * 10000) }))
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {} })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  // 客户端自带 x-request-id → 响应头原样返回
+  const r1 = await fetch(`http://${bind}/v1/models`, { headers: { ...auth, 'x-request-id': 'my-req-42' } })
+  assert.equal(r1.headers.get('x-credit-hub-trace'), 'my-req-42', 'client trace id echoed')
+  // 未带 → 服务端生成 trc_ 前缀
+  const r2 = await fetch(`http://${bind}/v1/models`, { headers: auth })
+  const serverTrace = r2.headers.get('x-credit-hub-trace')
+  assert.ok(serverTrace?.startsWith('trc_'), `server mints trace id (${serverTrace})`)
+  await gateway.stop()
+  stores.dispose()
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。

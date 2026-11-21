@@ -187,7 +187,7 @@ export function apply(ctx, config = {}) {
     usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage() }, 5000)
     usageFlushTimer.unref?.()
   }
-  const recordTurn = ({ model, ok, skipped, usage }) => {
+  const recordTurn = ({ model, ok, skipped, usage, traceId, ttfbMs, totalMs, error }) => {
     const row = usageStats.get(model) ?? { ok: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, lastAt: 0 }
     if (ok === true) row.ok += 1
     else if (skipped === true) row.skipped += 1
@@ -195,9 +195,22 @@ export function apply(ctx, config = {}) {
     row.inputTokens += usage?.inputTokens ?? 0
     row.outputTokens += usage?.outputTokens ?? 0
     row.lastAt = now()
+    // 可观测性（清单 #11）：首字节/总耗时做滚动统计（P50/avg 简表）
+    if (Number.isFinite(ttfbMs) && ttfbMs > 0) {
+      row.ttfbSamples = row.ttfbSamples ?? []
+      row.ttfbSamples.push(Math.round(ttfbMs))
+      if (row.ttfbSamples.length > 20) row.ttfbSamples.shift()
+    }
+    if (Number.isFinite(totalMs) && totalMs > 0) {
+      row.totalSamples = row.totalSamples ?? []
+      row.totalSamples.push(Math.round(totalMs))
+      if (row.totalSamples.length > 20) row.totalSamples.shift()
+    }
     usageStats.set(model, row)
     scheduleUsageFlush()
-    log({ scope: 'turn', message: `${model}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}` })
+    const latency = Number.isFinite(ttfbMs) && ttfbMs > 0 ? ` ttfb=${Math.round(ttfbMs)}ms` : ''
+    const trace = traceId ? ` [${traceId}]` : ''
+    log({ scope: 'turn', message: `${model}${trace}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}${latency}${error ? ` — ${String(error).slice(0, 120)}` : ''}` })
   }
   const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
   const gateway = startGateway({ stores, hub, logger, settings, log })

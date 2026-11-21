@@ -104,6 +104,7 @@ export function createApiRoutes(deps) {
           },
           gateway: { running: gateway.running, bind: gateway.running ? gateway.bind() : null, stats: gateway.stats() },
           usage: typeof deps.usage === 'function' ? deps.usage() : [],
+          breaker: typeof hub.breaker === 'function' ? hub.breaker() : {},
           modelCount: (await hub.catalog()).length,
         })
       }

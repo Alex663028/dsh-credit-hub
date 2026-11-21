@@ -13,7 +13,8 @@
  */
 
 import { UpstreamError, CODE } from './http.js'
-import { now, sanitizeEfforts, finiteOr } from './util.js'
+import { now, sanitizeEfforts, finiteOr, mintId } from './util.js'
+import { createBreaker } from './breaker.js'
 
 export const ROUTE_MAIN = 'credit-hub'
 
@@ -102,6 +103,11 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     const value = Number(settings().singleTurnMaxMs)
     return Number.isFinite(value) && value >= 5000 ? value : 600_000
   }
+
+  // 成员健康度熔断器（清单 #6）：连续 3 次失败 → 冷却 30s（指数退避封顶 10min），
+  // 半开放行一次试探。链路遍历时 canTry 命中冷却的成员直接跳过——
+  // 「明知道它挂着还去等它超时 25s」是最浪费的降级路径。
+  const breaker = createBreaker({ threshold: 3, baseCooldownMs: 30_000, maxCooldownMs: 600_000 })
 
   let catalogCache
   let catalogAt = 0
@@ -352,8 +358,21 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         ? (entry.cursor = ((entry.cursor ?? 0) + 1) % chain.length)
         : 0
       const tried = []
+      // 可观测性（清单 #11）：链路级 trace-id（网关层已生成则复用）+ 逐成员首字节耗时
+      const traceId = options.traceId ?? mintId('trc')
+      const startedWall = now()
+      const switches = []
+      let advancedCount = 0
       for (let index = 0; index < chain.length; index += 1) {
         const candidate = chain[(startIndex + index) % chain.length]
+        // 熔断冷却中的成员直接跳过（半开例外：放行一次试探）
+        const cooldown = breaker.canTry(candidate.id)
+        if (cooldown !== null) {
+          tried.push(`${candidate.id} (冷却中，剩 ${Math.ceil(cooldown / 1000)}s)`)
+          advancedCount += 1
+          continue
+        }
+        if (index > 0 || advancedCount > 0) switches.push(candidate.id)
         // 每个候选独立的 AbortController：静默超时/换跳时真正中止它的上游
         // 请求——否则 nextOrSilence 只关了读端，挂死的请求会在下方 request
         // 等待里堵死整条链，CHAIN_SILENCE_MS 形同虚设。
@@ -361,7 +380,9 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         const onOuterAbort = () => controller.abort(options.signal?.reason)
         if (options.signal?.aborted === true) onOuterAbort()
         else options.signal?.addEventListener('abort', onOuterAbort, { once: true })
-        const { channel, request } = runInto(candidate, { ...options, signal: controller.signal }, () => {}, controller.signal)
+        const candidateStartedAt = now()
+        let candidateFirstByteMs = 0
+        const { channel, request } = runInto(candidate, { ...options, signal: controller.signal, traceId }, () => {}, controller.signal)
         let committed = false
         let held = []
         let endValue
@@ -371,6 +392,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
             const row = committed ? await reader.next() : await nextOrSilence(reader, chainSilenceMs())
             if (row.done === true) { endValue = row.value; break }
             const chunk = row.value
+            if (candidateFirstByteMs === 0 && chunk?.type !== undefined) candidateFirstByteMs = now() - candidateStartedAt
             if (chunk?.__outcome !== undefined) { endValue = { value: chunk.__outcome }; break }
             // A candidate fault before commit is advanceable — walk to the next
             // link instead of surfacing the error to the caller.
@@ -401,16 +423,34 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
           yield { type: 'usage', usage: outcome.usage ?? { inputTokens: 0, outputTokens: 0 } }
           const kind = outcome.finish === 'max_tokens' || outcome.finish === 'length' ? 'max-tokens' : 'stop'
           yield { type: 'finish', reason: { kind } }
-          recordTurn?.({ at: Date.now(), model: candidate.id, ok: true, usage: outcome.usage })
+          breaker.recordSuccess(candidate.id)
+          recordTurn?.({
+            at: Date.now(), model: candidate.id, ok: true, usage: outcome.usage,
+            traceId, ttfbMs: candidateFirstByteMs, totalMs: now() - candidateStartedAt,
+            switchedFrom: switches.length > 0 ? switches : undefined,
+          })
           return
         }
         const failure = endValue?.value?.error
+        // 非重试类失败（auth/配置错）不熔断也不该换跳浪费时间——但为保兼容
+        // 仍走 advance（现有语义）；熔断只记可重试类失败。
+        if (failure?.retryable !== false) breaker.recordFailure(candidate.id, failure?.message)
         tried.push(`${candidate.id}${failure ? ` (${String(failure?.message ?? 'failed').slice(0, 80)})` : ''}`)
-        warn?.(`credit-hub: 链路 "${entry.name}" 跳过 ${candidate.id}${failure ? ` — ${failure.message ?? ''}` : ''}`)
+        warn?.(`credit-hub: [${traceId}] 链路 "${entry.name}" 跳过 ${candidate.id}${failure ? ` — ${failure.message ?? ''}` : ''}`)
         // 被跳过的成员失败也留痕，用量统计才完整
-        recordTurn?.({ at: Date.now(), model: candidate.id, ok: false, skipped: true, error: failure?.message })
+        recordTurn?.({
+          at: Date.now(), model: candidate.id, ok: false, skipped: true, error: failure?.message,
+          traceId, ttfbMs: candidateFirstByteMs, totalMs: now() - candidateStartedAt,
+        })
       }
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `链路 "${entry.name}" 全部候选失败：${tried.join('; ')}`, code: CODE.server, category: 'upstream', retryable: true } } }
+      const failureSummary = {
+        message: `链路 "${entry.name}" 全部候选失败：${tried.join('; ')}`,
+        code: CODE.server, category: 'upstream', retryable: true,
+        traceId,
+        advanced: advancedCount,
+        totalMs: now() - startedWall,
+      }
+      yield { type: 'finish', reason: { kind: 'error', failure: failureSummary } }
     },
 
     async * runSingle(options, entry) {
@@ -423,6 +463,8 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         return
       }
       const startedAt = now()
+      const traceId = options.traceId ?? mintId('trc')
+      let firstByteMs = 0
       // 自有 controller：静默/总时长到期时不仅要停止读取，还要 abort 上游请求；
       // 外层 signal（客户端断开）仍照常透传。
       const controller = new AbortController()
@@ -430,7 +472,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       if (options.signal?.aborted === true) controller.abort(options.signal?.reason)
       else options.signal?.addEventListener('abort', onOuterAbort, { once: true })
       const innerSignal = controller.signal
-      const { channel, request } = runInto(entry, { ...options, signal: innerSignal }, () => {}, innerSignal)
+      const { channel, request } = runInto(entry, { ...options, signal: innerSignal, traceId }, () => {}, innerSignal)
       let outcome
       let streamError
       let timedOut = false
@@ -457,6 +499,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
           }
           if (row.done === true) break
           const chunk = row.value
+          if (firstByteMs === 0 && chunk?.type !== undefined) firstByteMs = now() - startedAt
           if (chunk?.__outcome !== undefined) { outcome = chunk.__outcome; break }
           if (chunk?.__error !== undefined) { streamError = chunk.__error; break }
           yield chunk
@@ -506,18 +549,19 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
               ...(failure?.category !== undefined ? { category: failure.category }
                 : { category: aborted ? 'aborted' : 'network' }),
               retryable: failure?.retryable === true,
+              traceId,
               ...(Number.isInteger(failure?.status) ? { status: failure.status } : {}),
             },
           },
         }
-        recordTurn?.({ at: startedAt, model: entry.id, ok: false, error: failure?.message })
+        recordTurn?.({ at: startedAt, model: entry.id, ok: false, error: failure?.message, traceId, ttfbMs: firstByteMs, totalMs: now() - startedAt })
         return
       }
       yield { type: 'usage', ...(outcome.usage !== undefined ? { usage: outcome.usage } : { usage: { inputTokens: 0, outputTokens: 0 } }) }
       const finishToken = outcome.finish
       const kind = finishToken === 'max_tokens' || finishToken === 'length' ? 'max-tokens' : 'stop'
       yield { type: 'finish', reason: { kind }, ...(kind === 'stop' && !['stop', 'end_turn', 'stop_sequence'].includes(finishToken) ? { upstreamFinish: finishToken } : {}) }
-      recordTurn?.({ at: startedAt, model: entry.id, ok: true, usage: outcome.usage })
+      recordTurn?.({ at: startedAt, model: entry.id, ok: true, usage: outcome.usage, traceId, ttfbMs: firstByteMs, totalMs: now() - startedAt })
     },
   }
 
@@ -527,6 +571,8 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     catalog,
     invalidate,
     combos,
+    /** 成员熔断快照（管理面/调试用）。 */
+    breaker: () => breaker.snapshot(),
     async setCombos(list) {
       stores.routes.update(data => ({ ...data, combos: list }))
       invalidate()
