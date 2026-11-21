@@ -45,7 +45,8 @@ DSH 设置 → 积分汇通
 - **OpenCode 匿名免费车道**：`pk/opencode/*` 免费模型（DeepSeek V4.1 Flash Free、GLM 5.3 Flash Free 等）零成本汇入网关。
 - **API 中转预设 13 个**：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova、火山方舟（豆包）、百度千帆、魔搭 API-Inference。
 - **千帆 AK/SK 自动续期**：填 `AK:SK`，后台自动换 IAM access_token 并在到期前续期，无需手动刷新。
-- **降级链**：把模型串成链，失败自动 fallback / round-robin；成员熔断器（连续 3 次失败 → 指数冷却 → 半开试探）自动跳过挂掉成员，成功一次即复位。
+- **降级链**：把模型串成链，失败自动 fallback / round-robin；成员熔断器（连续 N 次失败 → 指数冷却 → 半开试探）自动跳过挂掉成员，成功一次即复位。阈值与冷却时长可在设置里调（`breaker.*`）。
+- **可观测性**：每个请求带 `x-credit-hub-trace`（复用客户端 `x-request-id`）；逐模型记录首字节（TTFB）与总耗时的 P50/P95 分位；目录按来源（workbuddy/upstreams/pack）报告健康状态。
 
 ## 文档
 
