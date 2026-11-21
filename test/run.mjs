@@ -26,6 +26,13 @@ import { postSse } from '../src/http.js'
 import { createRing } from '../src/util.js'
 
 let failures = 0
+// 进程级看门狗：任何测试在 CI/本地把事件循环钉住时，10 分钟强杀并报 FAIL，
+// 避免 GitHub Actions 上 "Host tests" 步骤无限期挂起（2026-11-21 实测发生过）。
+setTimeout(() => {
+  console.log(`\nFAIL watchdog: 测试套件 10 分钟未结束，进程强杀（可能有服务器句柄未关闭）`)
+  process.exitCode = 1
+  process.exit(1)
+}, 10 * 60_000).unref?.()
 const test = (name, fn) => {
   try { fn(); console.log(`ok   ${name}`) } catch (error) { failures += 1; console.log(`FAIL ${name}: ${error.message}`) }
 }
