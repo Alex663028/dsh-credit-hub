@@ -24,7 +24,9 @@
     "LICENSE",
     "README.md",
     "install.ps1",
-    "assets/banner.svg"
+    "market-index.json",
+    "assets/banner.svg",
+    "docs"
   ],
   "keywords": [
     "dsh",
@@ -80,10 +82,18 @@
     "@deepseek-ai/schemastery": "^3.18.4"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-credentials": { "optional": true },
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/schemastery": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-credentials": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "publishConfig": {
     "access": "public"

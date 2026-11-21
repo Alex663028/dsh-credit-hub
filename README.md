@@ -45,7 +45,12 @@ DSH 设置 → 积分汇通
 - **OpenCode 匿名免费车道**：`pk/opencode/*` 免费模型（DeepSeek V4.1 Flash Free、GLM 5.3 Flash Free 等）零成本汇入网关。
 - **API 中转预设 13 个**：DeepSeek、Z.ai、Kimi、MiniMax、SiliconFlow、OpenRouter、百炼、阶跃、Anthropic、SenseNova、火山方舟（豆包）、百度千帆、魔搭 API-Inference。
 - **千帆 AK/SK 自动续期**：填 `AK:SK`，后台自动换 IAM access_token 并在到期前续期，无需手动刷新。
-- **降级链**：把模型串成链，失败自动 fallback / round-robin。
+- **降级链**：把模型串成链，失败自动 fallback / round-robin；成员熔断器（连续 3 次失败 → 指数冷却 → 半开试探）自动跳过挂掉成员，成功一次即复位。
+
+## 文档
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 架构图、请求流转、模块清单、关键设计决策
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 按症状排查：模型消失/401/熔断/千帆 token/数据位置/与 ofm 共存
 - **本地网关**：OpenAI + Anthropic 双协议，模型 id 前缀 `wb/`、`up/`、`pk/`、`combo/`。
 - **安全设计**：日志脱敏、凭据 0600 + Windows ACL、管理面仅回环 + 同源。
 
@@ -68,6 +73,9 @@ POST /v1/chat/completions · GET /v1/models
 ANTHROPIC_BASE_URL = http://127.0.0.1:8330
 POST /v1/messages
 ```
+
+**可观测性**：每个网关响应都带 `x-credit-hub-trace` 响应头（客户端 `x-request-id` 优先复用），
+日志与用量统计按同一 trace-id 串联，逐模型记录首字节（TTFB）与总耗时样本。
 
 仅绑定回环地址；Key 落 `{DSH_HOME}/credit-hub/gateway/api-key`（0600 + Windows ACL 收紧）。
 
