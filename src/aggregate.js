@@ -230,7 +230,12 @@ export function createUpstreamRuntime({ stores, log }) {
     const bare = rest.join('/')
     const entry = read().find(row => row.id === upstreamId)
     if (!entry) throw new UpstreamError(`上游 ${upstreamId} 不存在`, CODE.notFound)
-    if (typeof entry.apiKey !== 'string' || entry.apiKey === '') throw new UpstreamError(`上游 ${entry.name} 未填 API Key`, CODE.auth)
+    // 千帆走 AK:SK → token 分支：先分流校验（报错口径是 AK:SK），再拦裸 Key 缺失
+    if (entry.id === 'preset-qianfan') {
+      await qianfanAccessToken(entry) // 未填/格式错时抛 AUTH，且口径为 AK:SK
+    } else if (typeof entry.apiKey !== 'string' || entry.apiKey === '') {
+      throw new UpstreamError(`上游 ${entry.name} 未填 API Key`, CODE.auth)
+    }
     const wire = entry.kind
     const warnings = []
     let body

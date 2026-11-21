@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check all entrypoints
+        shell: bash
+        run: |
+          node --check index.js
+          node --check client.js
+          for f in src/*.js; do node --check "$f"; done
+          for f in test/*.mjs; do node --check "$f"; done
+
+      - name: Host tests (unit + gateway e2e)
+        run: node test/run.mjs
+
+      - name: UI render smoke
+        run: node test/render-smoke.mjs
+
+      - name: Package integrity (files field matches disk)
+        shell: bash
+        run: |
+          node -e "
+          const p = require('./package.json');
+          const fs = require('fs');
+          const missing = (p.files ?? []).filter(f => !fs.existsSync(f));
+          if (missing.length) { console.error('files 引用了不存在的路径:', missing); process.exit(1); }
+          console.log('files 字段完整:', (p.files ?? []).length, '项');
+          "
+
+      - name: npm audit (high/critical only, non-blocking)
+        run: npm audit --audit-level=high || true

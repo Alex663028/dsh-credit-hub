@@ -900,5 +900,123 @@ await testAsync('management API rejects non-loopback host / origin / cross-site 
   await rmDir(dir)
 })
 
+// ── http.js 错误语义（清单 #1/#3/#7 覆盖缺口） ─────────────────────────────
+await testAsync('postJson maps 401/403/429/5xx to typed codes with envelope', async () => {
+  const { default: http } = await import('node:http')
+  const { postJson, CODE } = await import('../src/http.js')
+  const cases = [
+    [401, { error: { message: 'bad key' } }, CODE.auth],
+    [403, { error: { message: 'forbidden' } }, CODE.auth],
+    [404, { message: 'nope' }, CODE.notFound],
+    [429, { error: 'rate' }, CODE.rate],
+    [502, 'bad gateway', CODE.server],
+    [400, { error: { message: 'bad request' } }, CODE.client],
+  ]
+  const server = http.createServer((req, res) => {
+    const [status, payload] = cases[Number(req.url.slice(1))]
+    const headers = { 'content-type': 'application/json' }
+    if (status === 429) headers['retry-after'] = '7'
+    res.writeHead(status, headers)
+    res.end(JSON.stringify(payload))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${server.address().port}`
+  for (const [i, [status, , code]] of cases.entries()) {
+    try {
+      await postJson(`${base}/${i}`, { body: {} })
+      assert.fail(`status ${status} should throw`)
+    } catch (error) {
+      assert.equal(error.code, code, `status ${status} → code`)
+      assert.equal(error.status, status, `status ${status} → error.status`)
+      if (status === 429) {
+        assert.equal(error.rateLimited, true)
+        assert.equal(error.retryAfterMs, 7000, 'Retry-After: 7 → 7000ms')
+      }
+      if (status !== 502) assert.ok(error.envelope, `${status} carries parsed envelope`)
+    }
+  }
+  await new Promise(resolve => server.close(resolve))
+})
+
+await testAsync('Retry-After parses delta-seconds and HTTP-date; garbage is undefined', async () => {
+  const { default: http } = await import('node:http')
+  const { postJson } = await import('../src/http.js')
+  const values = ['120', 'Wed, 21 Oct 2026 07:28:00 GMT', 'soon-ish']
+  const server = http.createServer((req, res) => {
+    res.writeHead(429, { 'retry-after': values[Number(req.url.slice(1))] })
+    res.end('{}')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = `http://127.0.0.1:${server.address().port}`
+  const results = []
+  for (let i = 0; i < values.length; i++) {
+    try { await postJson(`${base}/${i}`, { body: {} }); results.push(undefined) }
+    catch (error) { results.push(error.retryAfterMs) }
+  }
+  assert.equal(results[0], 120_000, 'delta-seconds')
+  assert.ok(Number.isFinite(results[1]) && results[1] >= 0, 'HTTP-date → finite ms')
+  assert.equal(results[2], undefined, 'garbage → undefined')
+  await new Promise(resolve => server.close(resolve))
+})
+
+await testAsync('postSse surfaces plain-JSON error body as UpstreamError instead of hanging', async () => {
+  const { default: http } = await import('node:http')
+  const { postSse, CODE } = await import('../src/http.js')
+  const server = http.createServer((req, res) => {
+    res.writeHead(503, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { message: 'overloaded' } }))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  await assert.rejects(
+    () => postSse(`http://127.0.0.1:${server.address().port}/`, { body: {}, onEvent: () => {}, idleTimeoutMs: 2000 }),
+    error => error.code === CODE.server && error.status === 503,
+  )
+  await new Promise(resolve => server.close(resolve))
+})
+
+// ── 千帆 AK/SK → IAM token（方案 B 行为合同） ─────────────────────────────
+await testAsync('qianfan entry routes through token exchange path (not bare-key error)', async () => {
+  const { createUpstreamRuntime } = await import('../src/aggregate.js')
+  const dir = tmpDir('ch-qf-')
+  const stores = createStores(dir)
+  const runtime = createUpstreamRuntime({ stores, log: () => {} })
+  runtime.installPreset('qianfan')
+  try {
+    await runtime.streamTurn({ modelId: 'up/preset-qianfan/m', options: { messages: [{ role: 'user', content: 'x' }] }, onChunk: () => {} })
+    assert.fail('qianfan without key must not succeed silently')
+  } catch (error) {
+    assert.ok(!/未填 API Key/.test(error.message), 'token branch taken (bare-key check bypassed for qianfan)')
+  }
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('preset keyUrl surfaces for ark/qianfan/modelscope in presets view', async () => {
+  const dir = tmpDir('ch-keyurl-')
+  const stores = createStores(dir)
+  const runtime = createUpstreamRuntime({ stores, log: () => {} })
+  const presets = runtime.presets
+  const ark = presets.find(p => p.id === 'ark')
+  const qf = presets.find(p => p.id === 'qianfan')
+  const ms = presets.find(p => p.id === 'modelscope')
+  assert.ok(ark?.keyUrl?.startsWith('https://console.volcengine.com'), 'ark keyUrl')
+  assert.ok(qf?.keyUrl?.startsWith('https://console.bce.baidu.com'), 'qianfan keyUrl')
+  assert.ok(ms?.keyUrl?.startsWith('https://modelscope.cn'), 'modelscope keyUrl')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('non-qianfan preset stores AK:SK verbatim (no colon splitting)', async () => {
+  const dir = tmpDir('ch-rawkey-')
+  const stores = createStores(dir)
+  const runtime = createUpstreamRuntime({ stores, log: () => {} })
+  runtime.installPreset('deepseek')
+  runtime.upsert({ id: 'preset-deepseek', apiKey: 'AK:SK_COLON_KEY', baseURL: 'https://api.deepseek.com/v1', enabled: true })
+  const entry = stores.accounts.load().upstreams.find(row => row.id === 'preset-deepseek')
+  assert.equal(entry.apiKey, 'AK:SK_COLON_KEY', 'non-qianfan preset keeps raw key')
+  stores.dispose()
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 process.exitCode = failures === 0 ? 0 : 1
