@@ -1425,6 +1425,133 @@ await testAsync('hub sourceStatus reports per-source ok/count/error', async () =
   await rmDir(dir)
 })
 
+// ── 优先级五：协议转换共享夹具 ─────────────────────────────────────────────
+/**
+ * 共享 SSE 夹具（清单：三套协议不该各自独立断言）。
+ * parseSse(text) → [{ event, data }]；dataFrames(text) → 解析后的 data JSON 数组。
+ * 一次起网关，三种线各发一轮 scripted upstream 剧本，对事件序列做规范断言。
+ */
+const parseSse = text => text.split('\n\n').filter(block => block.trim()).map(block => {
+  let event = 'message'
+  const dataLines = []
+  for (const line of block.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+  }
+  return { event, data: dataLines.join('\n') }
+})
+const dataFrames = text => parseSse(text)
+  .map(frame => { try { return JSON.parse(frame.data) } catch { return null } })
+  .filter(row => row !== null)
+
+/** 剧本化 upstream：按脚本吐 chunk（id 已含来源前缀，对齐 aggregate.listModels 输出）。 */
+const scriptedUpstream = script => ({
+  listModels: async () => [{ id: 'up/m1', source: 'upstream', name: 'M1', contextWindow: 128000, maxOutput: 8192 }],
+  streamTurn: async ({ onChunk }) => { for (const step of script) onChunk(step); return { sawText: true, sawFinish: true, finish: 'stop', usage: { inputTokens: 3, outputTokens: 2 }, nextIndex: 1 } },
+  status: () => ({ accounts: 1, ok: 1 }),
+})
+
+await testAsync('protocol fixture: one gateway, three wires, scripted chunks → event sequences', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway, clampMaxTokens } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-proto-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 50000 + Math.floor(Math.random() * 9000) }))
+  // 剧本：reasoning → 文本 → 工具调用 → 结束（覆盖三个协议各自的映射难点）
+  const upstreams = scriptedUpstream([
+    { type: 'block-start', index: 0, blockType: 'reasoning' },
+    { type: 'reasoning-delta', index: 0, text: 'thinking…' },
+    { type: 'block-end', index: 0, block: { type: 'reasoning', text: 'thinking…' } },
+    { type: 'block-start', index: 1, blockType: 'text' },
+    { type: 'text-delta', index: 1, text: 'answer part' },
+    { type: 'block-end', index: 1, block: { type: 'text', text: 'answer part' } },
+    { type: 'block-start', index: 2, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 2, id: 'call_1', name: 'read_file', argumentsDelta: '{"pa' },
+    { type: 'tool-call-delta', index: 2, argumentsDelta: 'th":1}' },
+    { type: 'block-end', index: 2, block: { type: 'tool-call', id: 'call_1', name: 'read_file', arguments: '{"path":1}' } },
+  ])
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams, logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  try {
+    // ── OpenAI Chat Completions 线 ──
+    const oa = dataFrames(await (await fetch(`${base(bind)}/v1/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'up/m1', messages: [{ role: 'user', content: 'x' }], stream: true }) })).text())
+    const oaReason = oa.filter(f => f.choices?.[0]?.delta?.reasoning_content)
+    assert.equal(oaReason.length, 1, 'openai: reasoning delta mapped to reasoning_content')
+    assert.equal(oaReason[0].choices[0].delta.reasoning_content, 'thinking…')
+    const oaText = oa.filter(f => f.choices?.[0]?.delta?.content)
+    assert.equal(oaText.map(f => f.choices[0].delta.content).join(''), 'answer part')
+    const oaTool = oa.filter(f => f.choices?.[0]?.delta?.tool_calls)
+    assert.ok(oaTool.length >= 1, 'openai: tool-call deltas emitted')
+    assert.equal(oaTool[0].choices[0].delta.tool_calls[0].id, 'call_1')
+    assert.equal(oaTool.at(-1).choices[0].delta.tool_calls[0].function.arguments, '{"path":1}', 'openai: args accumulated')
+    const oaFinish = oa.find(f => f.choices?.[0]?.finish_reason)
+    assert.equal(oaFinish.choices[0].finish_reason, 'stop', 'openai: finish_reason present')
+    const oaUsage = oa.find(f => f.usage)
+    assert.equal(oaUsage.usage.total_tokens, 5, 'openai: usage attached to a frame')
+    assert.equal(oa.at(-1)?.choices?.[0]?.delta, undefined || oa.at(-1).choices[0].delta, 'openai: DONE frame shape irrelevant')
+
+    // ── Anthropic Messages 线 ──
+    const cl = parseSse(await (await fetch(`${base(bind)}/v1/messages`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'up/m1', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'x' }] }) })).text())
+    const clNames = cl.map(f => f.event)
+    assert.equal(clNames[0], 'message_start', 'anthropic opens with message_start')
+    assert.ok(clNames.includes('content_block_start'), 'anthropic: block start')
+    assert.ok(clNames.includes('content_block_delta'), 'anthropic: deltas')
+    assert.ok(clNames.includes('content_block_stop'), 'anthropic: block stop')
+    // thinking 块的 delta 类型是 thinking_delta
+    const clThinking = cl.filter(f => f.data.includes('thinking_delta'))
+    assert.ok(clThinking.length >= 1, 'anthropic: thinking_delta for reasoning chunks')
+    // 文本块与工具块 index 递增不复用
+    const blockStarts = cl.filter(f => f.event === 'content_block_start').map(f => JSON.parse(f.data))
+    const blockIdx = blockStarts.map(f => f.index)
+    assert.deepEqual(blockIdx, [...new Set(blockIdx)].sort(), 'anthropic: block indexes unique & ordered')
+    // tool_use 块最终 input_json 完整
+    const clToolDelta = cl.filter(f => f.data.includes('input_json_delta')).map(f => JSON.parse(f.data))
+    const toolJson = clToolDelta.map(f => f.delta.partial_json ?? '').join('')
+    assert.equal(toolJson, '{"path":1}', 'anthropic: input_json_delta concatenates to final args')
+    assert.ok(clNames.includes('message_delta') && clNames.includes('message_stop'), 'anthropic: message_delta + message_stop close the stream')
+    // usage 在 message_delta 的 usage 字段
+    const clUsage = cl.filter(f => f.event === 'message_delta').map(f => JSON.parse(f.data)).find(f => f.usage)
+    assert.ok(clUsage?.usage?.output_tokens >= 2, 'anthropic: usage rides message_delta')
+
+    // ── Responses 线 ──
+    const rs = parseSse(await (await fetch(`${base(bind)}/v1/responses`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'up/m1', input: 'x', stream: true }) })).text())
+    const rsNames = rs.map(f => f.event)
+    assert.equal(rsNames[0], 'response.created', 'responses opens with created')
+    assert.ok(rsNames.includes('response.output_item.added'), 'responses: output item added')
+    // reasoning item 生命状态：added → delta → done
+    const rsReasoningAdded = rs.filter(f => f.data.includes('"type":"reasoning"') && f.data.includes('output_item.added'))
+    assert.ok(rsReasoningAdded.length >= 1, 'responses: reasoning item has lifecycle events')
+    const rsReasonDone = rs.filter(f => f.event === 'response.reasoning_summary_text.done' || (f.data.includes('reasoning') && f.data.includes('.done')))
+    assert.ok(rsReasonDone.length >= 1, 'responses: reasoning item reaches .done')
+    assert.ok(rsNames.includes('response.output_text.delta'), 'responses: text deltas')
+    // 注：本网关的 Responses 线用 content_part.done + output_item.done 收尾文本块
+    // （与 OpenAI 官方的 output_text.done 事件名不同——codex-proxy 兼容层已按此实现验证）
+    const rsTextDone = rs.filter(f => f.event === 'response.content_part.done')
+    assert.ok(rsTextDone.length >= 1, 'responses: text part closes with content_part.done')
+    const partDone = rsTextDone.map(f => JSON.parse(f.data)).at(-1)
+    assert.equal(partDone.part.text, 'answer part', 'responses: done part carries full text')
+    // function_call 增量 + 最终参数
+    const rsFnDelta = rs.filter(f => f.data.includes('function_call_arguments.delta'))
+    const rsFnDone = rs.filter(f => f.data.includes('function_call_arguments.done'))
+    assert.ok(rsFnDelta.length >= 1 && rsFnDone.length >= 1, 'responses: function_call args delta + done')
+    const fnDoneArgs = rsFnDone.map(f => JSON.parse(f.data)).at(-1)
+    assert.equal(fnDoneArgs.arguments, '{"path":1}', 'responses: final args complete')
+    assert.ok(rsNames.includes('response.completed'), 'responses closes with completed')
+    const rsCompleted = rs.filter(f => f.event === 'response.completed').map(f => JSON.parse(f.data))[0]
+    assert.equal(rsCompleted.response.usage.total_tokens, 5, 'responses: usage in completed')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+// 上一段夹具依赖 base() 小工具
+function base(bind) { return `http://${bind}` }
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
