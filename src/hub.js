@@ -18,6 +18,12 @@ import { createBreaker } from './breaker.js'
 
 export const ROUTE_MAIN = 'credit-hub'
 
+/** settings 数值消毒：非有限/越界一律取默认。 */
+const positiveInt = (value, fallback, min, max) => {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : fallback
+}
+
 const ROUTE_LABELS = { [ROUTE_MAIN]: '积分汇通' }
 
 const SILENT = Symbol('credit-hub-silent-candidate')
@@ -104,10 +110,15 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     return Number.isFinite(value) && value >= 5000 ? value : 600_000
   }
 
-  // 成员健康度熔断器（清单 #6）：连续 3 次失败 → 冷却 30s（指数退避封顶 10min），
-  // 半开放行一次试探。链路遍历时 canTry 命中冷却的成员直接跳过——
-  // 「明知道它挂着还去等它超时 25s」是最浪费的降级路径。
-  const breaker = createBreaker({ threshold: 3, baseCooldownMs: 30_000, maxCooldownMs: 600_000 })
+  // 成员健康度熔断器（清单 #6）：阈值与冷却时长可在 settings 覆盖——
+  //   breaker.threshold（默认 3）连续失败熔断
+  //   breaker.baseCooldownMs（默认 30000）首次冷却
+  //   breaker.maxCooldownMs（默认 600000）指数退避封顶
+  const breaker = createBreaker({
+    threshold: positiveInt(settings().breaker?.threshold, 3, 1, 20),
+    baseCooldownMs: positiveInt(settings().breaker?.baseCooldownMs, 30_000, 1_000, 600_000),
+    maxCooldownMs: positiveInt(settings().breaker?.maxCooldownMs, 600_000, 10_000, 3_600_000),
+  })
 
   let catalogCache
   let catalogAt = 0

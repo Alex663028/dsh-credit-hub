@@ -15,20 +15,9 @@ import path from 'node:path'
 import { mintKey, keyMatches } from './store.js'
 import { now, mintId } from './util.js'
 import { CODE } from './http.js'
-
-/** hub finish 块 → Responses 线的完成 token。 */
-const outcomeFinishToken = reason => reason?.kind === 'max-tokens' ? 'max_tokens'
-  : reason?.kind === 'stop' ? 'stop'
-  : reason?.kind ?? 'stop'
-
-/** harness usage → OpenAI 线上协议字段（prompt/completion/total_tokens）。 */
-const openAiUsage = usage => usage ? {
-  prompt_tokens: usage.inputTokens ?? 0,
-  completion_tokens: usage.outputTokens ?? 0,
-  total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
-  ...(usage.reasoningTokens ? { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } } : {}),
-  ...(usage.cacheReadTokens ? { prompt_tokens_details: { cached_tokens: usage.cacheReadTokens } } : {}),
-} : undefined
+import { openAiToHarness, openAiUsage, finishToOpenAi, openAiChunkFrames, partsText } from './transforms/openai.js'
+import { claudeToHarness, claudeUsage } from './transforms/claude.js'
+import { outcomeFinishToken, responsesInputToHarness, responsesToolsToHarness, responsesUsage } from './transforms/responses.js'
 
 const MAX_BODY = 32 * 1024 * 1024
 
@@ -131,94 +120,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     return false
   }
 
-  // ── harness options ← external wire bodies ────────────────────────────────
-  const openAiToHarness = messages => {
-    const out = []
-    for (const message of messages ?? []) {
-      const role = message?.role
-      if (role === 'system' || role === 'developer') {
-        out.push({ role: 'system', content: typeof message.content === 'string' ? message.content : partsText(message.content) })
-        continue
-      }
-      if (role === 'tool') {
-        out.push({
-          role: 'tool',
-          content: [{ type: 'tool-result', toolCallId: String(message.tool_call_id ?? ''), content: [{ type: 'text', text: typeof message.content === 'string' ? message.content : partsText(message.content) }] }],
-        })
-        continue
-      }
-      if (role === 'assistant') {
-        const blocks = []
-        const text = typeof message.content === 'string' ? message.content : partsText(message.content)
-        if (text) blocks.push({ type: 'text', text })
-        for (const call of message.tool_calls ?? []) {
-          blocks.push({ type: 'tool-call', id: String(call.id ?? ''), name: String(call.function?.name ?? ''), arguments: String(call.function?.arguments ?? '{}') })
-        }
-        out.push({ role: 'assistant', content: blocks, ...(typeof message.reasoning_content === 'string' ? { reasoning_content: message.reasoning_content } : {}) })
-        continue
-      }
-      const blocks = []
-      if (typeof message.content === 'string' && message.content) blocks.push({ type: 'text', text: message.content })
-      for (const part of Array.isArray(message.content) ? message.content : []) {
-        if (part?.type === 'text' && part.text) blocks.push({ type: 'text', text: part.text })
-        else if (part?.type === 'image_url') {
-          const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url
-          if (typeof url === 'string') blocks.push({ type: 'image', image: url })
-        }
-      }
-      out.push({ role: 'user', content: blocks.length > 0 ? blocks : '' })
-    }
-    return out
-  }
-
-  const partsText = parts => (Array.isArray(parts) ? parts.filter(part => part?.type === 'text').map(part => part.text).join('\n') : '')
-
-  const claudeToHarness = body => {
-    const out = []
-    if (typeof body.system === 'string' && body.system) out.push({ role: 'system', content: body.system })
-    else if (Array.isArray(body.system)) {
-      const text = body.system.filter(block => block?.type === 'text').map(block => block.text).join('\n')
-      if (text) out.push({ role: 'system', content: text })
-    }
-    for (const message of body.messages ?? []) {
-      if (message.role === 'user') {
-        const blocks = []
-        const results = []
-        for (const block of Array.isArray(message.content) ? message.content : [{ type: 'text', text: String(message.content ?? '') }]) {
-          if (block.type === 'text' && block.text) blocks.push({ type: 'text', text: block.text })
-          else if (block.type === 'image' && block.source?.type === 'base64') {
-            blocks.push({ type: 'image', image: `data:${block.source.media_type};base64,${block.source.data}` })
-          } else if (block.type === 'tool_result') {
-            const inner = Array.isArray(block.content)
-              ? block.content.filter(part => part?.type === 'text').map(part => part.text).join('\n')
-              : String(block.content ?? '')
-            results.push({ type: 'tool-result', toolCallId: String(block.tool_use_id ?? ''), content: [{ type: 'text', text: inner }] })
-          }
-        }
-        // 混合内容（同一条 user 消息里既有文本又有 tool_result）必须两条都保留，
-        // 旧版二选一会把普通文本静默丢掉。
-        if (results.length > 0 && blocks.length > 0) {
-          out.push({ role: 'user', content: blocks })
-          out.push({ role: 'tool', content: results })
-        } else {
-          out.push(results.length > 0 ? { role: 'tool', content: results } : { role: 'user', content: blocks })
-        }
-        continue
-      }
-      if (message.role === 'assistant') {
-        const blocks = []
-        for (const block of Array.isArray(message.content) ? message.content : []) {
-          if (block.type === 'text' && block.text) blocks.push({ type: 'text', text: block.text })
-          else if (block.type === 'tool_use') {
-            blocks.push({ type: 'tool-call', id: String(block.id ?? ''), name: String(block.name ?? ''), arguments: JSON.stringify(block.input ?? {}) })
-          }
-        }
-        if (blocks.length > 0) out.push({ role: 'assistant', content: blocks })
-      }
-    }
-    return out
-  }
-
+  // ── harness options ← external wire bodies（转换器在 src/transforms/） ─────
   const harnessOptions = (body, messages, wire) => ({
     model: String(body.model ?? ''),
     messages,
@@ -231,9 +133,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     sessionId: wire === 'claude' ? String(body.metadata?.user_id ?? '') : String(body.user ?? ''),
   })
 
-  // ── harness chunks → external SSE ─────────────────────────────────────────
-  const finishToOpenAi = reason => reason?.kind === 'max-tokens' ? 'length'
-    : reason?.kind === 'error' || reason?.kind === 'aborted' ? 'stop' : 'stop'
+  // ── harness chunks → external SSE（finishToOpenAi 在 transforms/openai.js） ─
 
   async function streamOpenAi(res, options, model, signal) {
     const call = await hub.adapter.prepareCall(hub.route, model)
@@ -413,7 +313,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         return { ok: false, usage, error: failure }
       }
       if (openKind !== null) frame({ type: 'content_block_stop', index: openIndex })
-      frame({ type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: { input_tokens: usage.inputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 } })
+      frame({ type: 'message_delta', delta: { stop_reason: finish, stop_sequence: null }, usage: claudeUsage(usage) })
       frame({ type: 'message_stop' })
       res.end()
       return { ok: true, usage }
@@ -455,7 +355,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       model,
       content,
       stop_reason: finish,
-      usage: { input_tokens: usage?.inputTokens ?? 0, output_tokens: usage?.outputTokens ?? 0 },
+      usage: claudeUsage(usage),
       ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
     })
     return { ok: !failure, usage, error: failure ?? undefined }
@@ -465,54 +365,8 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     try { return JSON.parse(text) } catch { return { _raw: text } }
   }
 
-  // ── OpenAI Responses 线（/v1/responses，Codex wire——EKKO 等 codex 系 agent） ──
-  const responsesInputToHarness = body => {
-    const messages = []
-    if (typeof body.instructions === 'string' && body.instructions) messages.push({ role: 'system', content: body.instructions })
-    const input = body.input
-    if (typeof input === 'string') {
-      messages.push({ role: 'user', content: input })
-      return messages
-    }
-    for (const item of Array.isArray(input) ? input : []) {
-      if (item?.type === 'message') {
-        const role = item.role === 'assistant' ? 'assistant'
-          : item.role === 'system' || item.role === 'developer' ? 'system' : 'user'
-        if (typeof item.content === 'string') { messages.push({ role, content: item.content }); continue }
-        const blocks = []
-        for (const part of Array.isArray(item.content) ? item.content : []) {
-          if (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'text') blocks.push({ type: 'text', text: String(part.text ?? '') })
-          else if (part?.type === 'input_image' && typeof part.image_url === 'string') blocks.push({ type: 'image', image: part.image_url })
-        }
-        if (blocks.length > 0) messages.push({ role, content: blocks })
-        continue
-      }
-      if (item?.type === 'function_call') {
-        messages.push({
-          role: 'assistant',
-          content: [{ type: 'tool-call', id: String(item.call_id ?? item.id ?? mintId('call')), name: String(item.name ?? ''), arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}) }],
-        })
-        continue
-      }
-      if (item?.type === 'function_call_output') {
-        messages.push({
-          role: 'tool',
-          content: [{ type: 'tool-result', toolCallId: String(item.call_id ?? ''), content: [{ type: 'text', text: String(item.output ?? '') }] }],
-        })
-        continue
-      }
-      // reasoning 等内部项不回传上游
-    }
-    return messages
-  }
-
-  const responsesToolsToHarness = tools => (Array.isArray(tools) ? tools : [])
-    .filter(tool => tool?.type === 'function' || tool?.name)
-    .map(tool => ({
-      name: String(tool.name ?? ''),
-      description: typeof tool.description === 'string' ? tool.description : '',
-      parameters: tool.parameters && typeof tool.parameters === 'object' ? tool.parameters : { type: 'object', properties: {} },
-    }))
+  // ── OpenAI Responses 线（/v1/responses，Codex wire——EKKO 等 codex 系 agent）──
+  // 入站/工具/usage 转换在 transforms/responses.js；流式状态机在此。
 
   async function completeResponses(res, options, model, signal) {
     const call = await hub.adapter.prepareCall(hub.route, model)
@@ -551,11 +405,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       status: failure ? 'failed' : 'completed',
       model,
       output,
-      usage: {
-        input_tokens: usage?.inputTokens ?? 0,
-        output_tokens: usage?.outputTokens ?? 0,
-        total_tokens: (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0),
-      },
+      usage: responsesUsage(usage),
       ...(finishToken === 'max_tokens' && !failure ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
       ...(failure ? { error: { message: String(failure.message ?? 'gateway error'), type: 'gateway_error' } } : {}),
     })
@@ -654,7 +504,7 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         type: 'response.completed',
         response: {
           id: responseId, object: 'response', status: 'completed', model, output,
-          usage: { input_tokens: usage?.inputTokens ?? 0, output_tokens: usage?.outputTokens ?? 0, total_tokens: (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) },
+          usage: responsesUsage(usage),
           ...(finishToken === 'max_tokens' ? { incomplete_details: { reason: 'max_output_tokens' } } : {}),
         },
       })

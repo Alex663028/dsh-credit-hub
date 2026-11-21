@@ -1552,6 +1552,66 @@ await testAsync('protocol fixture: one gateway, three wires, scripted chunks →
 // 上一段夹具依赖 base() 小工具
 function base(bind) { return `http://${bind}` }
 
+// ── 第三阶段：配置迁移 + 熔断参数消毒 ──────────────────────────────────────
+await testAsync('stores.migrate: schemaVersion bump + legacy checkinMarks cleanup', async () => {
+  const { createStores } = await import('../src/store.js')
+  const dir = tmpDir('ch-mig-')
+  // createStores(dir) 的 dir 是 home —— 数据落在 dir/credit-hub/（对齐既有迁移测试）
+  fs.mkdirSync(path.join(dir, 'credit-hub'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'credit-hub', 'settings.json'), JSON.stringify({
+    gatewayPort: 9000,
+    checkinMarks: { '2026-11-20': true, '2026-11-21:wb_abc': 'ok', 'other': false },
+  }), 'utf8')
+  const stores = createStores(dir)
+  const result = stores.migrate()
+  assert.equal(result.changed, true, 'migration reports change')
+  assert.equal(result.schemaVersion, 2)
+  const after = stores.settings.load()
+  assert.equal(after.schemaVersion, 2)
+  assert.equal(after.gatewayPort, 9000, 'user settings preserved')
+  assert.equal(after.checkinMarks['2026-11-20'], undefined, 'boolean mark dropped')
+  assert.equal(after.checkinMarks['other'], undefined, 'no-account suffix dropped')
+  assert.equal(after.checkinMarks['2026-11-21:wb_abc'], 'ok', 'valid mark kept')
+  // 幂等：再跑一次不再报变化
+  const second = stores.migrate()
+  assert.equal(second.changed, false, 'idempotent')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('breaker settings sanitized: invalid threshold/cooldowns fall back to defaults', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-brkcfg-')
+  const stores = createStores(dir)
+  // 全部非法：threshold 0 / 负冷却 / 非数字
+  stores.settings.update(s => ({ ...s, breaker: { threshold: 0, baseCooldownMs: -500, maxCooldownMs: 'bogus' } }))
+  let calls = 0
+  const rateLimited = {
+    listModels: async () => [{ id: 'wb/rl', source: 'workbuddy', name: 'RL', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async () => { calls += 1; throw new UpstreamError('rate limited', CODE.rate) },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: rateLimited, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.setCombos([{ name: 'c', strategy: 'fallback', chain: ['wb/rl', 'up/m1'] }])
+  const runOnce = async () => {
+    const call = await hub.adapter.prepareCall('credit-hub', 'combo/c')
+    for await (const chunk of call.stream({ model: 'combo/c', messages: [{ role: 'user', content: 'x' }] })) { /* drain */ }
+  }
+  // 非法 threshold=0 → 回退默认 3：前 2 次失败不熔断，第 3 次才熔断
+  await runOnce(); await runOnce()
+  assert.equal(hub.breaker()['wb/rl']?.state ?? 'closed', 'closed', 'invalid threshold fell back to 3 (not tripped yet)')
+  await runOnce()
+  assert.equal(hub.breaker()['wb/rl'].state, 'open', 'tripped at sanitized threshold 3')
+  assert.ok(hub.breaker()['wb/rl'].cooldownRemainingMs >= 30_000, 'base cooldown sanitized to 30000')
+  stores.dispose()
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
