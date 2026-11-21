@@ -109,6 +109,42 @@ export function createApiRoutes(deps) {
           modelCount: (await hub.catalog()).length,
         })
       }
+      // ── 统一诊断快照（优先级五：前端只读一个接口，避免多处轮询状态漂移） ──
+      if (method === 'GET' && routePath === '/diagnostics') {
+        const catalogStatus = typeof hub.catalogStatus === 'function' ? hub.catalogStatus() : {}
+        const breakerRows = typeof hub.breaker === 'function' ? hub.breaker() : {}
+        return send(200, {
+          at: now(),
+          version,
+          ok: settings().enabled !== false && gateway.running !== false,
+          catalog: {
+            ...catalogStatus,
+            sources: typeof hub.sourceStatus === 'function' ? hub.sourceStatus() : {},
+          },
+          breakers: {
+            summary: typeof hub.breakerSummary === 'function' ? hub.breakerSummary() : {},
+            entries: breakerRows,
+          },
+          gateway: {
+            running: gateway.running,
+            bind: gateway.running ? gateway.bind() : null,
+            stats: gateway.stats(),
+          },
+          channels: {
+            workbuddy: workbuddy.status(),
+            upstreams: upstreams.status(),
+            pack: {
+              status: deps.packStatus?.() ?? { mounted: false, reason: 'unknown' },
+              ofmPresent: ofmPresent(stores.home),
+            },
+          },
+          // 最近失败原因（前端"最近失败"区块直接用，不再各自拉日志）
+          recentFailures: (typeof deps.usage === 'function' ? deps.usage() : [])
+            .filter(row => (row.failed ?? 0) > 0)
+            .slice(0, 5)
+            .map(row => ({ model: row.model, failed: row.failed, lastAt: row.lastAt })),
+        })
+      }
       if (method === 'GET' && routePath === '/settings') return send(200, { settings: settings() })
       if (method === 'POST' && routePath === '/settings') {
         const body = await readJson(req)

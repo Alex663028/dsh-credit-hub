@@ -613,6 +613,34 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
     breaker: () => breaker.snapshot(),
     /** 手动重置熔断（管理面单独暴露，POST + 前端二次确认）。 */
     resetBreaker: ids => breaker.reset(ids),
+    /**
+     * 目录缓存状态（统一诊断快照的一部分）。
+     * cacheAgeMs 超 TTL 说明下一次调用会重算；inflight 为 true 说明正在重算。
+     */
+    catalogStatus() {
+      const age = catalogCache ? now() - catalogAt : null
+      return {
+        modelCount: catalogCache?.length ?? 0,
+        cached: catalogCache !== undefined,
+        cacheAgeMs: age,
+        ttlMs: 45_000,
+        stale: catalogCache === undefined || age === null || age >= 45_000,
+        inflight: catalogInflight !== null,
+      }
+    },
+    /** 熔断聚合计数（统一诊断快照用）。 */
+    breakerSummary() {
+      const rows = Object.values(breaker.snapshot())
+      const count = state => rows.filter(row => row.state === state).length
+      const cooldowns = rows.map(row => row.cooldownRemainingMs ?? 0).filter(ms => ms > 0)
+      return {
+        total: rows.length,
+        open: count('open'),
+        halfOpen: count('half-open'),
+        closed: count('closed'),
+        cooldownRemainingMs: cooldowns.length > 0 ? Math.max(...cooldowns) : 0,
+      }
+    },
     /** 目录来源状态（清单：诊断闭环）——总览页按来源显示异常而非笼统零模型。 */
     sourceStatus() {
       const out = {}

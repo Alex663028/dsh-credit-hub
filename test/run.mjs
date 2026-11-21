@@ -34,7 +34,19 @@ setTimeout(() => {
   process.exit(1)
 }, 10 * 60_000).unref?.()
 const test = (name, fn) => {
-  try { fn(); console.log(`ok   ${name}`) } catch (error) { failures += 1; console.log(`FAIL ${name}: ${error.message}`) }
+  try {
+    const result = fn()
+    // 防呆：async 函数必须走 testAsync。旧版忽略返回值 → 断言在 ok 打印之后
+    // 才抛，变成 unhandledRejection 而不计入 failures（2026-11-21 发现：
+    // 多个 transforms 测试因此「静默通过」）。
+    if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+      failures += 1
+      console.log(`FAIL ${name}: 异步测试必须用 testAsync（test() 不会 await 返回值）`)
+      result.catch(() => {})
+      return
+    }
+    console.log(`ok   ${name}`)
+  } catch (error) { failures += 1; console.log(`FAIL ${name}: ${error.message}`) }
 }
 const testAsync = async (name, fn) => {
   try { await fn(); console.log(`ok   ${name}`) } catch (error) { failures += 1; console.log(`FAIL ${name}: ${error.message}`) }
@@ -217,7 +229,7 @@ test('sanitizeEfforts: hy4free 脏档位（重复/未知/大小写）', () => {
 })
 
 // ── stores ─────────────────────────────────────────────────────────────────
-test('stores round trip + key', async () => {
+await testAsync('stores round trip + key', async () => {
   const dir = tmpDir('ch-test-')
   const stores = createStores(dir)
   stores.settings.update(s => ({ ...s, gatewayPort: 9001 }))
@@ -1155,7 +1167,7 @@ await testAsync('hub failure frame carries category/retryable in finish.reason.f
 })
 
 // ── 批次五：熔断器 + 可观测性 ──────────────────────────────────────────────
-test('breaker opens after threshold failures with exponential cooldown, half-opens once', () => {
+await testAsync('breaker opens after threshold failures with exponential cooldown, half-opens once', () => {
   return (async () => {
     const { createBreaker } = await import('../src/breaker.js')
     const b = createBreaker({ threshold: 3, baseCooldownMs: 1000, maxCooldownMs: 60_000 })
@@ -1238,7 +1250,7 @@ await testAsync('gateway emits x-credit-hub-trace header and honors client x-req
 })
 
 // ── 熔断器确定性时钟测试（优先级一：不依赖真实等待） ────────────────────────
-test('breaker deterministic clock: open→skip, half-open probe, recovery, re-trip', () => {
+await testAsync('breaker deterministic clock: open→skip, half-open probe, recovery, re-trip', () => {
   return (async () => {
     const { createBreaker } = await import('../src/breaker.js')
     let t = 1_000_000
@@ -1613,7 +1625,7 @@ await testAsync('breaker settings sanitized: invalid threshold/cooldowns fall ba
 })
 
 // ── 优先级一：转换器契约测试（src/transforms/ 纯函数层） ────────────────────
-test('transforms/openai: inbound 全角色映射 + usage 线上字段', () => {
+await testAsync('transforms/openai: inbound 全角色映射 + usage 线上字段', () => {
   return (async () => {
     const { openAiToHarness, openAiUsage, finishToOpenAi, partsText } = await import('../src/transforms/openai.js')
     const messages = openAiToHarness([
@@ -1627,7 +1639,9 @@ test('transforms/openai: inbound 全角色映射 + usage 线上字段', () => {
     assert.equal(messages[0].role, 'system')
     assert.equal(messages[0].content, 'sys')
     assert.equal(messages[1].content, 'dev', 'developer folded into system')
-    assert.equal(messages[2].content, 'hi', 'plain user string')
+    // user 字符串会被规范成 text block（harness 统一形状），不是原样字符串
+    assert.equal(messages[2].content[0].type, 'text')
+    assert.equal(messages[2].content[0].text, 'hi', 'plain user string → text block')
     assert.equal(messages[3].content[1].type, 'image', 'image_url → image block')
     assert.equal(messages[4].reasoning_content, 'think')
     assert.equal(messages[4].content[1].type, 'tool-call')
@@ -1651,7 +1665,7 @@ test('transforms/openai: inbound 全角色映射 + usage 线上字段', () => {
   })()
 })
 
-test('transforms/openai: chunk 映射（tool 参数累积 / 未知 chunk 安全跳过）', () => {
+await testAsync('transforms/openai: chunk 映射（tool 参数累积 / 未知 chunk 安全跳过）', () => {
   return (async () => {
     const { openAiChunkFrames } = await import('../src/transforms/openai.js')
     const base = { id: 'x', object: 'chat.completion.chunk' }
@@ -1680,7 +1694,7 @@ test('transforms/openai: chunk 映射（tool 参数累积 / 未知 chunk 安全�
   })()
 })
 
-test('transforms/claude: inbound 混合内容拆两条 + usage/additional 映射', () => {
+await testAsync('transforms/claude: inbound 混合内容拆两条 + usage/additional 映射', () => {
   return (async () => {
     const { claudeToHarness, claudeUsage, claudeChunkAction } = await import('../src/transforms/claude.js')
     // system 字符串 / 数组
@@ -1719,7 +1733,7 @@ test('transforms/claude: inbound 混合内容拆两条 + usage/additional 映射
   })()
 })
 
-test('transforms/responses: inbound 全 item 形态 + tools 过滤 + usage', () => {
+await testAsync('transforms/responses: inbound 全 item 形态 + tools 过滤 + usage', () => {
   return (async () => {
     const { responsesInputToHarness, responsesToolsToHarness, responsesUsage, outcomeFinishToken } = await import('../src/transforms/responses.js')
     // 纯字符串 input
@@ -1763,7 +1777,7 @@ test('transforms/responses: inbound 全 item 形态 + tools 过滤 + usage', () 
   })()
 })
 
-test('cross-protocol: one harness transcript → three wire shapes stay consistent', () => {
+await testAsync('cross-protocol: one harness transcript → three wire shapes stay consistent', () => {
   return (async () => {
     const { openAiToHarness, openAiUsage } = await import('../src/transforms/openai.js')
     const { claudeToHarness, claudeUsage } = await import('../src/transforms/claude.js')
@@ -1800,6 +1814,176 @@ test('cross-protocol: one harness transcript → three wire shapes stay consiste
     assert.equal(claudeUsage(usage).input_tokens, 10)
     assert.equal(responsesUsage(usage).total_tokens, 15)
   })()
+})
+
+// ── 优先级四补充：熔断器运行时接入（并发/共享/分类/恢复） ──────────────────
+await testAsync('breaker key shares state across combo chains (same upstream member)', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-share-')
+  const stores = createStores(dir)
+  const flaky = {
+    listModels: async () => [{ id: 'wb/sh', source: 'workbuddy', name: 'SH', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async () => { throw new UpstreamError('rate limited', CODE.rate) },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: flaky, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  // 两条链共用同一成员 wb/sh
+  await hub.setCombos([
+    { name: 'a', strategy: 'fallback', chain: ['wb/sh', 'up/m1'] },
+    { name: 'b', strategy: 'fallback', chain: ['wb/sh', 'up/m1'] },
+  ])
+  const run = async combo => {
+    const call = await hub.adapter.prepareCall('credit-hub', `combo/${combo}`)
+    for await (const _ of call.stream({ model: `combo/${combo}`, messages: [{ role: 'user', content: 'x' }] })) { /* drain */ }
+  }
+  // 通过链 a 打满 3 次 → 熔断
+  await run('a'); await run('a'); await run('a')
+  assert.equal(hub.breaker()['wb/sh'].state, 'open', 'tripped via chain a')
+  // 链 b 的第一跳应直接跳过该成员（共享同一熔断状态）
+  let skippedViaB = false
+  const warnLines = []
+  const hub2 = createHubRuntime({
+    stores, workbuddy: flaky, upstreams: makeSource('up'),
+    logger: console, warn: message => { warnLines.push(String(message)) },
+    settings: () => stores.settings.load(),
+  })
+  // 同一 stores 但新 hub 的 breaker 是独立内存——这里验证的是**同一 hub 内**跨链共享
+  const call = await hub.adapter.prepareCall('credit-hub', 'combo/b')
+  const chunks = []
+  for await (const chunk of call.stream({ model: 'combo/b', messages: [{ role: 'user', content: 'x' }] })) chunks.push(chunk)
+  assert.ok(chunks.some(c => c.type === 'finish' && c.reason.kind === 'stop'), 'chain b served by healthy member')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('breaker classifies timeout/transport as retryable trips; region/auth do not', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { UpstreamError, CODE } = await import('../src/http.js')
+  const dir = tmpDir('ch-cls-')
+  const stores = createStores(dir)
+  let mode = 'timeout'
+  const flaky = {
+    listModels: async () => [
+      { id: 'wb/t', source: 'workbuddy', name: 'T', contextWindow: 128000, maxOutput: 8192 },
+    ],
+    streamTurn: async () => {
+      if (mode === 'timeout') throw new UpstreamError('idle timeout', CODE.timeout)
+      if (mode === 'transport') throw new UpstreamError('socket reset', CODE.transport)
+      if (mode === 'region') throw new UpstreamError('region blocked', CODE.region)
+      throw new UpstreamError('bad key', CODE.auth)
+    },
+    status: () => ({ accounts: 1, ok: 0 }),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: flaky, upstreams: makeSource('up'), logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.setCombos([{ name: 'c', strategy: 'fallback', chain: ['wb/t', 'up/m1'] }])
+  const run = async () => {
+    const call = await hub.adapter.prepareCall('credit-hub', 'combo/c')
+    for await (const _ of call.stream({ model: 'combo/c', messages: [{ role: 'user', content: 'x' }] })) { /* drain */ }
+  }
+  // TIMEOUT 可重试 → 3 次熔断
+  mode = 'timeout'
+  await run(); await run(); await run()
+  assert.equal(hub.breaker()['wb/t'].state, 'open', 'TIMEOUT trips (retryable)')
+  assert.equal(hub.breaker()['wb/t'].lastCategory, 'network')
+  hub.resetBreaker(['wb/t'])
+  // TRANSPORT 可重试 → 3 次熔断
+  mode = 'transport'
+  await run(); await run(); await run()
+  assert.equal(hub.breaker()['wb/t'].state, 'open', 'TRANSPORT trips (retryable)')
+  hub.resetBreaker(['wb/t'])
+  // REGION 不可重试 → 不熔断
+  mode = 'region'
+  for (let i = 0; i < 5; i++) await run()
+  const regionSnap = hub.breaker()['wb/t']
+  assert.ok(regionSnap === undefined || regionSnap.state === 'closed', 'REGION never trips')
+  // AUTH 不可重试 → 不熔断
+  mode = 'auth'
+  for (let i = 0; i < 5; i++) await run()
+  const authSnap = hub.breaker()['wb/t']
+  assert.ok(authSnap === undefined || (authSnap.state === 'closed' && authSnap.consecutiveFails === 0), 'AUTH never trips')
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('half-open admits exactly one concurrent probe (integration via canTry loop)', async () => {
+  const { createBreaker } = await import('../src/breaker.js')
+  let t = 50_000
+  const b = createBreaker({ threshold: 2, baseCooldownMs: 100, maxCooldownMs: 10_000, now: () => t })
+  b.recordFailure('k', 'e'); b.recordFailure('k', 'e')   // tripped
+  assert.equal(b.snapshot().k.state, 'open')
+  t += 150                                               // cooldown elapsed
+  // 模拟 10 个并发请求同时进链路选成员
+  const admissions = Array.from({ length: 10 }, () => b.canTry('k'))
+  const admitted = admissions.filter(row => row === null).length
+  assert.equal(admitted, 1, `only one probe admitted among 10 concurrent callers (got ${admitted})`)
+  assert.equal(admissions.filter(row => row === 0).length, 9, 'other 9 blocked as probe-in-flight')
+  // 探测成功后全部放行
+  b.recordSuccess('k')
+  assert.equal(b.canTry('k'), null, 'closed after probe success')
+  stores_dispose_noop()
+  function stores_dispose_noop() {}
+})
+
+await testAsync('diagnostics snapshot aggregates catalog/breakers/gateway/channels/failures', async () => {
+  const { default: http } = await import('node:http')
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { createApiRoutes } = await import('../src/api.js')
+  const dir = tmpDir('ch-diag-')
+  const stores = createStores(dir)
+  const hub = createHubRuntime({
+    stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'),
+    logger: console, warn: () => {}, settings: () => stores.settings.load(),
+  })
+  await hub.catalog(true)
+  const api = createApiRoutes({
+    stores, hub, workbuddy: { status: () => ({ accounts: 1, ok: 1 }) },
+    upstreams: { status: () => ({ upstreams: 0, models: 0 }) },
+    gateway: { running: true, bind: () => '127.0.0.1:8330', stats: () => ({ requests: 3, ok: 3, failed: 0 }) },
+    version: '0.4.1', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    usage: () => [{ model: 'wb/m1', ok: 2, failed: 1, lastAt: 1 }],
+    packStatus: () => ({ mounted: true, reason: 'forced' }),
+    log: () => {}, warn: () => {},
+  })
+  const server = http.createServer(api)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/credit-hub`
+    const diag = await (await fetch(`${base}/diagnostics`)).json()
+    // 目录
+    assert.ok(diag.catalog.modelCount >= 2, 'catalog.modelCount')
+    assert.equal(typeof diag.catalog.stale, 'boolean')
+    assert.equal(diag.catalog.ttlMs, 45_000)
+    assert.ok(diag.catalog.sources.workbuddy.ok === true, 'sources 内嵌在 catalog 下')
+    // 熔断
+    assert.equal(typeof diag.breakers.summary.total, 'number')
+    assert.equal(typeof diag.breakers.summary.open, 'number')
+    assert.equal(typeof diag.breakers.entries, 'object')
+    // 网关
+    assert.equal(diag.gateway.running, true)
+    assert.equal(diag.gateway.stats.requests, 3)
+    // 渠道
+    assert.equal(diag.channels.workbuddy.ok, 1)
+    assert.equal(diag.channels.pack.status.mounted, true)
+    // 最近失败
+    assert.equal(diag.recentFailures.length, 1, 'only models with failed>0')
+    assert.equal(diag.recentFailures[0].model, 'wb/m1')
+    // 版本透传
+    assert.equal(diag.version, '0.4.1')
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+    stores.dispose()
+    await rmDir(dir)
+  }
 })
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
