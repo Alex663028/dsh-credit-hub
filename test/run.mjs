@@ -1155,4 +1155,7 @@ await testAsync('hub failure frame carries category/retryable in finish.reason.f
 })
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
-process.exitCode = failures === 0 ? 0 : 1
+// 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
+// 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
+// 测试结论已打印，强制退出不影响结果正确性。
+process.exit(failures === 0 ? 0 : 1)
