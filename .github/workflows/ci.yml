@@ -27,11 +27,14 @@ jobs:
         run: |
           node --check index.js
           node --check client.js
-          for f in src/*.js; do node --check "$f"; done
+          for f in src/*.js src/transforms/*.js; do node --check "$f"; done
           for f in test/*.mjs; do node --check "$f"; done
 
-      - name: Host tests (unit + gateway e2e + protocol fixture)
+      - name: Host tests (unit + gateway e2e + protocol fixture + transform contracts)
         run: node test/run.mjs
+
+      - name: Client apply contract (slot registration)
+        run: node test/client-apply.mjs
 
       - name: UI render smoke
         run: node test/render-smoke.mjs
@@ -55,33 +58,16 @@ jobs:
           const fs = require('fs');
           const log = fs.readFileSync('pack-output.log', 'utf8');
           if (!log.includes('dsh-credit-hub-')) { console.error('npm pack 未产出包名'); process.exit(1); }
-          if (!log.includes('total files:')) { console.error('npm pack 输出缺 total files'); process.exit(1); }
           const m = log.match(/total files: (\d+)/);
+          if (!m) { console.error('npm pack 输出缺 total files'); process.exit(1); }
           const count = Number(m[1]);
           if (count < 25) { console.error('打包文件数异常:', count); process.exit(1); }
+          if (!log.includes('transforms/openai.js')) { console.error('打包产物缺 transforms 模块'); process.exit(1); }
           console.log('pack OK:', count, 'files');
           "
 
-      - name: market-index.json validation (format 1 rules)
-        shell: bash
-        run: |
-          node -e "
-          const fs = require('fs');
-          const idx = JSON.parse(fs.readFileSync('market-index.json', 'utf8'));
-          if (idx.format !== 1) throw new Error('format 必须是 1');
-          if (!idx.title || !idx.title.en || !idx.title.zh) throw new Error('title 需含 en/zh');
-          if (!Array.isArray(idx.plugins) || idx.plugins.length === 0) throw new Error('plugins 为空');
-          for (const p of idx.plugins) {
-            if (!/^[a-z0-9][a-z0-9._-]*$/.test(p.name)) throw new Error('非法包名: ' + p.name);
-            if (!Array.isArray(p.versions) || p.versions.length === 0) throw new Error(p.name + ' 无版本');
-            for (const v of p.versions) {
-              if (!/^[0-9a-f]{40}$/.test(v.source?.commit ?? '')) throw new Error(p.name + '@' + v.version + ' commit 非法');
-              if (v.source?.type !== 'git' && v.source?.type !== 'npm') throw new Error('source.type 非法');
-              if (!Number.isFinite(v.publishTimestamp)) throw new Error('publishTimestamp 非法');
-            }
-          }
-          console.log('market-index OK:', idx.plugins.length, '插件');
-          "
+      - name: Release artifact checks (pack contents / secrets / version sync / install safety)
+        run: node test/release-check.mjs
 
       - name: Docs internal links check (relative md targets exist)
         shell: bash
@@ -89,7 +75,7 @@ jobs:
           node -e "
           const fs = require('fs');
           const path = require('path');
-          const files = ['README.md', 'docs/ARCHITECTURE.md', 'docs/TROUBLESHOOTING.md'];
+          const files = ['README.md', 'docs/ARCHITECTURE.md', 'docs/TROUBLESHOOTING.md', 'docs/PROTOCOL-MATRIX.md'];
           let bad = 0;
           for (const file of files) {
             if (!fs.existsSync(file)) { console.error('缺文件:', file); bad++; continue; }

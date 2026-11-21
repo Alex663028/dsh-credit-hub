@@ -1612,6 +1612,196 @@ await testAsync('breaker settings sanitized: invalid threshold/cooldowns fall ba
   await rmDir(dir)
 })
 
+// ── 优先级一：转换器契约测试（src/transforms/ 纯函数层） ────────────────────
+test('transforms/openai: inbound 全角色映射 + usage 线上字段', () => {
+  return (async () => {
+    const { openAiToHarness, openAiUsage, finishToOpenAi, partsText } = await import('../src/transforms/openai.js')
+    const messages = openAiToHarness([
+      { role: 'system', content: 'sys' },
+      { role: 'developer', content: [{ type: 'text', text: 'dev' }] },
+      { role: 'user', content: 'hi' },
+      { role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,x' } }] },
+      { role: 'assistant', content: 'ans', reasoning_content: 'think', tool_calls: [{ id: 'c1', function: { name: 'f', arguments: '{"a":1}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'result' },
+    ])
+    assert.equal(messages[0].role, 'system')
+    assert.equal(messages[0].content, 'sys')
+    assert.equal(messages[1].content, 'dev', 'developer folded into system')
+    assert.equal(messages[2].content, 'hi', 'plain user string')
+    assert.equal(messages[3].content[1].type, 'image', 'image_url → image block')
+    assert.equal(messages[4].reasoning_content, 'think')
+    assert.equal(messages[4].content[1].type, 'tool-call')
+    assert.equal(messages[5].content[0].type, 'tool-result')
+    assert.equal(messages[5].content[0].toolCallId, 'c1')
+    // usage 只在有值时生成，字段名是线上协议名
+    assert.equal(openAiUsage(null), undefined, 'no usage → undefined (not a zero object)')
+    const u = openAiUsage({ inputTokens: 5, outputTokens: 2 })
+    assert.deepEqual(u, { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 })
+    const u2 = openAiUsage({ inputTokens: 1, outputTokens: 1, reasoningTokens: 3, cacheReadTokens: 4 })
+    assert.equal(u2.completion_tokens_details.reasoning_tokens, 3)
+    assert.equal(u2.prompt_tokens_details.cached_tokens, 4)
+    // finish：只有 max-tokens 映射 length，错误/中止都收 stop（错误另走 error 帧）
+    assert.equal(finishToOpenAi({ kind: 'max-tokens' }), 'length')
+    assert.equal(finishToOpenAi({ kind: 'stop' }), 'stop')
+    assert.equal(finishToOpenAi({ kind: 'error' }), 'stop')
+    assert.equal(finishToOpenAi({ kind: 'aborted' }), 'stop')
+    assert.equal(finishToOpenAi({ kind: 'weird-custom' }), 'stop', 'unknown finish → stop')
+    assert.equal(finishToOpenAi(undefined), 'stop')
+    assert.equal(partsText([{ type: 'text', text: 'x' }, { type: 'image' }, { type: 'text', text: 'y' }]), 'x\ny')
+  })()
+})
+
+test('transforms/openai: chunk 映射（tool 参数累积 / 未知 chunk 安全跳过）', () => {
+  return (async () => {
+    const { openAiChunkFrames } = await import('../src/transforms/openai.js')
+    const base = { id: 'x', object: 'chat.completion.chunk' }
+    // 文本增量
+    let r = openAiChunkFrames({ type: 'text-delta', text: 'hi' }, { base, openTool: null })
+    assert.equal(r.frames[0].choices[0].delta.content, 'hi')
+    assert.equal(r.frames[0].choices[0].finish_reason, null)
+    // 工具增量累积
+    r = openAiChunkFrames({ type: 'tool-call-delta', id: 'c1', name: 'f', argumentsDelta: '{"a' }, { base, openTool: null })
+    assert.equal(r.frames.length, 0, 'delta 阶段不吐帧')
+    r = openAiChunkFrames({ type: 'tool-call-delta', argumentsDelta: ':1}' }, { base, openTool: r.openTool })
+    assert.equal(r.openTool.args, '{"a:1}', 'args 跨 chunk 累积')
+    // 工具块结束 → 一次性吐完整帧
+    const done = openAiChunkFrames({ type: 'block-end', block: { type: 'tool-call', id: 'c1', name: 'f', arguments: '{"a":1}' } }, { base, openTool: r.openTool })
+    assert.equal(done.frames.length, 1)
+    const call = done.frames[0].choices[0].delta.tool_calls[0]
+    assert.equal(call.id, 'c1')
+    assert.equal(call.function.name, 'f')
+    assert.equal(done.openTool, null, '发帧后清空 openTool')
+    // 未知 chunk 安全跳过（不抛）
+    const unknown = openAiChunkFrames({ type: 'totally-unknown-kind' }, { base, openTool: null })
+    assert.equal(unknown.frames.length, 0, 'unknown chunk → zero frames, no throw')
+    // usage/finish 由主循环处理，映射层不吐帧
+    assert.equal(openAiChunkFrames({ type: 'usage' }, { base, openTool: null }).frames.length, 0)
+    assert.equal(openAiChunkFrames({ type: 'finish' }, { base, openTool: null }).frames.length, 0)
+  })()
+})
+
+test('transforms/claude: inbound 混合内容拆两条 + usage/additional 映射', () => {
+  return (async () => {
+    const { claudeToHarness, claudeUsage, claudeChunkAction } = await import('../src/transforms/claude.js')
+    // system 字符串 / 数组
+    assert.equal(claudeToHarness({ system: 'sys', messages: [] })[0].content, 'sys')
+    assert.equal(claudeToHarness({ system: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }], messages: [] })[0].content, 'a\nb')
+    // 混合内容：文本 + tool_result 必须拆成 user + tool 两条（旧版二选一会丢文本）
+    const mixed = claudeToHarness({
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'why' },
+          { type: 'tool_result', tool_use_id: 'tu1', content: [{ type: 'text', text: 'r' }] },
+        ],
+      }],
+    })
+    assert.equal(mixed.length, 2, 'split into user + tool')
+    assert.equal(mixed[0].role, 'user')
+    assert.equal(mixed[0].content[0].text, 'why')
+    assert.equal(mixed[1].role, 'tool')
+    assert.equal(mixed[1].content[0].toolCallId, 'tu1')
+    // base64 image → data URL
+    const img = claudeToHarness({ messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA' } }] }] })
+    assert.equal(img[0].content[0].image, 'data:image/png;base64,AAA')
+    // tool_use → tool-call（input 对象序列化）
+    const asst = claudeToHarness({ messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'f', input: { a: 1 } }] }] })
+    assert.equal(asst[0].content[0].arguments, '{"a":1}')
+    // usage 映射
+    assert.deepEqual(claudeUsage({ inputTokens: 3, outputTokens: 4 }), { input_tokens: 3, output_tokens: 4 })
+    assert.deepEqual(claudeUsage(null), { input_tokens: 0, output_tokens: 0 }, 'null usage → zeros')
+    // chunk action
+    assert.equal(claudeChunkAction({ type: 'text-delta', text: 'x' }).delta.type, 'text_delta')
+    assert.equal(claudeChunkAction({ type: 'reasoning-delta', text: 'x' }).delta.type, 'thinking_delta')
+    assert.equal(claudeChunkAction({ type: 'block-end', block: { type: 'tool-call' } }).action, 'tool-block')
+    assert.equal(claudeChunkAction({ type: 'usage' }), null, 'usage handled by main loop')
+    assert.equal(claudeChunkAction({ type: 'unknown' }), null, 'unknown → null, no throw')
+  })()
+})
+
+test('transforms/responses: inbound 全 item 形态 + tools 过滤 + usage', () => {
+  return (async () => {
+    const { responsesInputToHarness, responsesToolsToHarness, responsesUsage, outcomeFinishToken } = await import('../src/transforms/responses.js')
+    // 纯字符串 input
+    const simple = responsesInputToHarness({ input: 'hi' })
+    assert.equal(simple[0].role, 'user')
+    assert.equal(simple[0].content, 'hi')
+    // instructions → system
+    const withInstructions = responsesInputToHarness({ instructions: 'be nice', input: 'hi' })
+    assert.equal(withInstructions[0].role, 'system')
+    // message item（content 数组）
+    const msg = responsesInputToHarness({ input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'q' }] }] })
+    assert.equal(msg[0].content[0].text, 'q')
+    // function_call / function_call_output
+    const fn = responsesInputToHarness({ input: [
+      { type: 'function_call', call_id: 'c1', name: 'f', arguments: '{"a":1}' },
+      { type: 'function_call_output', call_id: 'c1', output: 'res' },
+    ] })
+    assert.equal(fn[0].content[0].type, 'tool-call')
+    assert.equal(fn[1].content[0].type, 'tool-result')
+    assert.equal(fn[1].content[0].toolCallId, 'c1')
+    // reasoning item 不回传上游
+    const withReasoning = responsesInputToHarness({ input: [{ type: 'reasoning', summary: [] }, { type: 'message', role: 'user', content: 'x' }] })
+    assert.equal(withReasoning.length, 1, 'reasoning item dropped')
+    // tools：过滤非 function、缺省补空 schema
+    const tools = responsesToolsToHarness([
+      { type: 'function', name: 'a', description: 'da', parameters: { type: 'object' } },
+      { name: 'b' },
+      { type: 'not-a-function' },
+      null,
+    ])
+    assert.equal(tools.length, 2, 'non-function filtered out')
+    assert.equal(tools[0].name, 'a')
+    assert.equal(tools[1].parameters.type, 'object', 'missing parameters → empty object schema')
+    // usage
+    assert.deepEqual(responsesUsage({ inputTokens: 2, outputTokens: 3 }), { input_tokens: 2, output_tokens: 3, total_tokens: 5 })
+    assert.deepEqual(responsesUsage(null), { input_tokens: 0, output_tokens: 0, total_tokens: 0 })
+    // finish token
+    assert.equal(outcomeFinishToken({ kind: 'max-tokens' }), 'max_tokens')
+    assert.equal(outcomeFinishToken({ kind: 'stop' }), 'stop')
+    assert.equal(outcomeFinishToken({ kind: 'custom-x' }), 'custom-x', 'unknown passthrough')
+  })()
+})
+
+test('cross-protocol: one harness transcript → three wire shapes stay consistent', () => {
+  return (async () => {
+    const { openAiToHarness, openAiUsage } = await import('../src/transforms/openai.js')
+    const { claudeToHarness, claudeUsage } = await import('../src/transforms/claude.js')
+    const { responsesInputToHarness, responsesUsage } = await import('../src/transforms/responses.js')
+    // 同一轮对话在三种线格式下的入站结果，harness 侧应等价
+    const openaiIn = openAiToHarness([
+      { role: 'system', content: 'be brief' },
+      { role: 'user', content: 'q1' },
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ])
+    const claudeIn = claudeToHarness({
+      system: 'be brief',
+      messages: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
+        { role: 'user', content: 'q2' },
+      ],
+    })
+    const responsesIn = responsesInputToHarness({
+      instructions: 'be brief',
+      input: [
+        { type: 'message', role: 'user', content: 'q1' },
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'a1' }] },
+        { type: 'message', role: 'user', content: 'q2' },
+      ],
+    })
+    const norm = rows => rows.map(r => `${r.role}:${typeof r.content === 'string' ? r.content : (r.content?.[0]?.text ?? '')}`)
+    assert.deepEqual(norm(openaiIn), norm(claudeIn), 'openai vs claude inbound equivalent')
+    assert.deepEqual(norm(openaiIn), norm(responsesIn), 'openai vs responses inbound equivalent')
+    // usage 三线各自的线上字段名与数值一致
+    const usage = { inputTokens: 10, outputTokens: 5 }
+    assert.equal(openAiUsage(usage).total_tokens, 15)
+    assert.equal(claudeUsage(usage).input_tokens, 10)
+    assert.equal(responsesUsage(usage).total_tokens, 15)
+  })()
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
