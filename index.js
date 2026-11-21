@@ -248,7 +248,16 @@ export function apply(ctx, config = {}) {
       settingsKeys: SETTINGS_KEYS,
       packStatus: () => packStatus,
       broadcast: broadcastCatalogChanged,
-      usage: () => [...usageStats.entries()].map(([model, row]) => ({ model, ...row })).sort((a, b) => (b.ok + b.failed) - (a.ok + a.failed)).slice(0, 12),
+      usage: () => [...usageStats.entries()].map(([model, row]) => {
+        // 可观测性（清单 #11）：TTFB/总耗时样本 → P50/P95 分位（最近 20 个样本）
+        const quantile = samples => {
+          if (!Array.isArray(samples) || samples.length === 0) return undefined
+          const sorted = [...samples].sort((a, b) => a - b)
+          const pick = q => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))]
+          return { p50: pick(0.5), p95: pick(0.95) }
+        }
+        return { model, ...row, ttfb: quantile(row.ttfbSamples), latency: quantile(row.totalSamples) }
+      }).sort((a, b) => (b.ok + b.failed) - (a.ok + a.failed)).slice(0, 12),
       logs: () => logRing.list(),
       clearLogs: () => logRing.clear(),
       log, warn,
