@@ -452,14 +452,24 @@
       }, done ? `✔ ${t('ov.copied')}` : t('ov.copy'))
     }
 
-    /** 每 interval 自动轮询；tab 不可见时暂停；offset 错峰（多卡不同相位）。 */
+    /** 每 interval 自动轮询；tab 不可见时暂停；offset 错峰（多卡不同相位）。
+     * 在途保护：上一次 fn 还没返回时不再次发起，避免慢请求堆积与乱序覆盖。 */
     const usePoll = (fn, ms, offset = 0) => {
       const saved = useRef(fn)
       saved.current = fn
+      const inFlight = useRef(false)
       useEffect(() => {
         let alive = true
         let timer = null
-        const tick = () => { if (alive && document.visibilityState !== 'hidden') void saved.current?.() }
+        const tick = () => {
+          if (!alive || document.visibilityState === 'hidden') return
+          if (inFlight.current) return // 上一次还没回来：本轮跳过
+          inFlight.current = true
+          try {
+            const result = saved.current?.()
+            Promise.resolve(result).catch(() => {}).then(() => { inFlight.current = false })
+          } catch { inFlight.current = false }
+        }
         const kickoff = setTimeout(() => { tick(); timer = setInterval(tick, ms) }, offset)
         return () => { alive = false; clearTimeout(kickoff); if (timer) clearInterval(timer) }
       }, [ms, offset])
@@ -595,16 +605,22 @@
       const [summary, setSummary] = useState(null)
       const [gateway, setGateway] = useState(null)
       const [toast, showToast] = useToast()
+      const seq = useRef(0)
       const load = useCallback(() => {
-        void api('/summary').then(setSummary).catch(() => {})
-        void api('/gateway').then(setGateway).catch(() => {})
+        const mySeq = ++seq.current
+        void api('/summary').then(payload => { if (mySeq === seq.current) setSummary(payload) }).catch(() => {})
+        void api('/gateway').then(payload => { if (mySeq === seq.current) setGateway(payload) }).catch(() => {})
       }, [])
       usePoll(load, 10_000)
 
       const bind = gateway?.bind ?? '127.0.0.1:8330'
       const key = gateway?.key ?? ''
-      const openaiRecipe = `OPENAI_BASE_URL=http://${bind}/v1\nOPENAI_API_KEY=${key}`
-      const claudeRecipe = `ANTHROPIC_BASE_URL=http://${bind}\nANTHROPIC_AUTH_TOKEN=${key}`
+      // 密钥遮罩（清单 #4）：总览页常驻展示配方，Key 默认打码，点「显示」才完整出现。
+      const [recipeReveal, setRecipeReveal] = useState(false)
+      const masked = key ? `${key.slice(0, 4)}…${key.slice(-4)}` : ''
+      const maskKey = text => (recipeReveal || !key ? text : text.split(key).join(masked))
+      const openaiRecipe = maskKey(`OPENAI_BASE_URL=http://${bind}/v1\nOPENAI_API_KEY=${key}`)
+      const claudeRecipe = maskKey(`ANTHROPIC_BASE_URL=http://${bind}\nANTHROPIC_AUTH_TOKEN=${key}`)
 
       const stat = (label, value, sub) => h('div', { className: 'ch-stat' },
         h('div', { className: 'ch-stat-value' }, value ?? '—'),
@@ -623,7 +639,9 @@
 
       const recipeCard = (title, recipe) => h(Card, { title, accent: '#4b7bff' },
         h('pre', { className: 'ch-recipe' }, recipe),
-        h('div', { className: 'ch-row' }, h(CopyBtn, { text: recipe })))
+        h('div', { className: 'ch-row' },
+          h(CopyBtn, { text: recipe }),
+          key ? h(Btn, { small: true, onClick: () => setRecipeReveal(!recipeReveal) }, recipeReveal ? t('gw.hide') : t('gw.show')) : null))
 
       return h('div', { className: 'ch-stack' },
         h(Onboarding, { settings, onSettings, goTab }),
@@ -674,7 +692,15 @@
       const [import_, setImport] = useState({ accessToken: '', refreshToken: '' })
       const [toast, showToast] = useToast()
 
-      const load = useCallback(() => { void api('/workbuddy/accounts').then(payload => setAccounts(payload.accounts)).catch(() => {}) }, [])
+      // 操作序号（清单 #5）：轮询与手动操作并发时，只有「最新发出」的响应才允许
+      // 写状态 —— 旧请求晚到覆盖新数据（账号列表闪烁回旧值）是典型症状。
+      const loadSeq = useRef(0)
+      const load = useCallback(() => {
+        const seq = ++loadSeq.current
+        void api('/workbuddy/accounts').then(payload => {
+          if (seq === loadSeq.current) setAccounts(payload.accounts)
+        }).catch(() => {})
+      }, [])
       usePoll(load, 8000)
 
       const loadWbModels = useCallback(async () => {
@@ -966,9 +992,11 @@
       const [summary, setSummary] = useState(null)
       const [hubModels, setHubModels] = useState([])
       const [toast, showToast] = useToast()
+      const pageSeq = useRef(0)
       useEffect(() => {
-        void api('/summary').then(setSummary).catch(() => {})
-        void api('/models').then(payload => setHubModels(payload.models ?? [])).catch(() => {})
+        const mySeq = ++pageSeq.current
+        void api('/summary').then(payload => { if (mySeq === pageSeq.current) setSummary(payload) }).catch(() => {})
+        void api('/models').then(payload => { if (mySeq === pageSeq.current) setHubModels(payload.models ?? []) }).catch(() => {})
       }, [])
       const packReason = summary?.pack?.status?.reason
       const mounted = packReason === 'forced' || packReason === 'auto' || summary?.pack?.status?.mounted === true
@@ -1134,7 +1162,9 @@
       const bind = gw?.bind ?? '127.0.0.1:8330'
       const key = gw?.key ?? ''
       const exampleModel = row.models?.[0]?.id ? `up/${row.id}/${row.models[0].id}` : `up/${row.id}/<模型id>`
-      const curl = `curl http://${bind}/v1/chat/completions \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${exampleModel}","messages":[{"role":"user","content":"hi"}]}'`
+      // 同总览页：默认打码，面板打开时本来就是主动操作场景，完整显示但复制按钮用完整串
+      const maskedKey = key ? `${key.slice(0, 4)}…${key.slice(-4)}` : ''
+      const curl = `curl http://${bind}/v1/chat/completions \\\n  -H "Authorization: Bearer ${maskedKey}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${exampleModel}","messages":[{"role":"user","content":"hi"}]}'`
 
       const editPanel = panel === 'edit' && form ? h('div', { className: 'ch-uppanel' },
         h('div', { className: 'ch-grid' },
