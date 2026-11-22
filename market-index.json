@@ -93,6 +93,18 @@
       },
       "versions": [
         {
+          "version": "0.4.7",
+          "publishTimestamp": 1795317234,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/Alex663028/dsh-credit-hub",
+            "commit": "24e7133dc33fd0b8725b12f8d563e418b7abf0ce"
+          },
+          "engines": {
+            "dsh": "^0.2.2-rc.3 || >=0.2.2"
+          }
+        },
+        {
           "version": "0.4.6",
           "publishTimestamp": 1795316935,
           "source": {
