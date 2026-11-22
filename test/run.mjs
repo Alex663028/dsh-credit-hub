@@ -1619,7 +1619,8 @@ await testAsync('breaker settings sanitized: invalid threshold/cooldowns fall ba
   assert.equal(hub.breaker()['wb/rl']?.state ?? 'closed', 'closed', 'invalid threshold fell back to 3 (not tripped yet)')
   await runOnce()
   assert.equal(hub.breaker()['wb/rl'].state, 'open', 'tripped at sanitized threshold 3')
-  assert.ok(hub.breaker()['wb/rl'].cooldownRemainingMs >= 30_000, 'base cooldown sanitized to 30000')
+  // 冷却从熔断瞬间起算 30000ms，断言执行时已流逝若干 ms —— 严格 >=30000 会偶发失败
+  assert.ok(hub.breaker()['wb/rl'].cooldownRemainingMs >= 25_000, 'base cooldown sanitized to 30000 (clock-drift tolerant)')
   stores.dispose()
   await rmDir(dir)
 })
