@@ -24,7 +24,12 @@ import { createWorkbuddyAdapter } from './src/workbuddy-adapter.js'
 import { createRing, now } from './src/util.js'
 
 const require = createRequire(import.meta.url)
-const { version } = require('./package.json')
+// 版本号每次启动时从磁盘重读：`set_bundle` 开关重挂只重配 Loader entry，不清
+// Node 的 CJS 模块缓存——缓存的 package.json 会让 /summary 显示旧版本串，
+// 用户会误以为升级没生效（实际功能代码已是最新）。绕过缓存读盘即可。
+const pkgPath = require.resolve('./package.json')
+delete require.cache[pkgPath]
+const { version } = require(pkgPath)
 
 /**
  * 解析 schemastery：`link:` 安装时插件真实路径在工作区，Node 从真实路径回溯
