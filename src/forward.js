@@ -15,6 +15,7 @@ import path from 'node:path'
 import { mintKey, keyMatches } from './store.js'
 import { now, mintId } from './util.js'
 import { CODE } from './http.js'
+import { createTokenBucket, createFailureCounter } from './rate-limit.js'
 import { openAiToHarness, openAiUsage, finishToOpenAi, openAiChunkFrames, partsText } from './transforms/openai.js'
 import { claudeToHarness, claudeUsage } from './transforms/claude.js'
 import { outcomeFinishToken, responsesInputToHarness, responsesToolsToHarness, responsesUsage } from './transforms/responses.js'
@@ -61,9 +62,14 @@ export function saveApiKey(gatewayDir, key) {
 export function startGateway({ stores, hub, logger, settings, log }) {
   let apiKey = loadOrCreateApiKey(stores.gatewayDir)
   let servers = []
-  let stats = { requests: 0, ok: 0, failed: 0, lastAt: 0 }
+  let stats = { requests: 0, ok: 0, failed: 0, lastAt: 0, rateLimited: 0 }
   let starting = null
   let boundPort = null
+  // 速率限制（优先级六）：120 突发容量，每 500ms 回填 1 个（≈2 req/s 持续速率）。
+  // 内存态，重启复位。msPerToken 语义：回填 1 个令牌需要的毫秒数。
+  const rateLimit = createTokenBucket({ capacity: 120, msPerToken: 500 })
+  // 鉴权失败计数：10/50 次打告警，成功后清零
+  const authFailures = createFailureCounter()
 
   const bind = () => `127.0.0.1:${boundPort ?? currentPort()}`
 
@@ -144,7 +150,17 @@ export function startGateway({ stores, hub, logger, settings, log }) {
       'x-accel-buffering': 'no',
     })
     const id = `chatcmpl-${Date.now().toString(36)}`
-    const frame = payload => res.write(`data: ${JSON.stringify(payload)}\n\n`)
+    // 响应增长上限（优先级六）：默认 64MB/请求。失控上游吐无限内容时
+    // 在客户端侧截断，而不是任由内存与带宽被吃光。截断以 error 帧收尾。
+    const RESPONSE_CAP = 64 * 1024 * 1024
+    let responseBytes = 0
+    const frame = payload => {
+      const encoded = `data: ${JSON.stringify(payload)}\n\n`
+      responseBytes += Buffer.byteLength(encoded)
+      if (responseBytes > RESPONSE_CAP) return false
+      res.write(encoded)
+      return true
+    }
     const base = { id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model }
     let toolIndex = 0
     let usage = null
@@ -152,10 +168,11 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     let failure = null
     let openTool = null
     try {
+      let responseCapped = false
       for await (const chunk of call.stream({ ...options, signal })) {
         if (signal.aborted) break
-        if (chunk.type === 'text-delta') frame({ ...base, choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] })
-        else if (chunk.type === 'reasoning-delta') frame({ ...base, choices: [{ index: 0, delta: { reasoning_content: chunk.text }, finish_reason: null }] })
+        if (chunk.type === 'text-delta') { if (frame({ ...base, choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] }) === false) { responseCapped = true; break } }
+        else if (chunk.type === 'reasoning-delta') { if (frame({ ...base, choices: [{ index: 0, delta: { reasoning_content: chunk.text }, finish_reason: null }] }) === false) { responseCapped = true; break } }
         else if (chunk.type === 'tool-call-delta') {
           openTool = openTool ?? { index: toolIndex, id: chunk.id, name: chunk.name ?? '', args: '' }
           if (chunk.id) openTool.id = chunk.id
@@ -181,6 +198,9 @@ export function startGateway({ stores, hub, logger, settings, log }) {
             failure = chunk.reason?.failure ?? { message: chunk.reason?.kind === 'aborted' ? 'request aborted' : 'upstream error' }
           }
         }
+      }
+      if (responseCapped && failure === null) {
+        failure = { message: `响应超过 ${Math.round(RESPONSE_CAP / 1024 / 1024)}MB 上限，已截断`, code: 'RESPONSE_CAP' }
       }
       if (failure !== null) {
         // 失败流：以 OpenAI 惯例的独立 error 帧终止（多数客户端会把它当
@@ -551,13 +571,32 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         if (allowOrigin) res.setHeader('access-control-allow-origin', allowOrigin)
         let rawBody = ''
         if (routePath === '/healthz') return send(res, 200, { ok: true })
+        // ── 速率限制（优先级六）：令牌桶，按客户端 IP 计数 ──────────────────
+        // 网关只绑回环，正常场景不会触发；防的是失控 agent 死循环重试与
+        // 本机其它用户的进程狂打。401 也计数（防 Key 暴力枚举）。
+        const clientIp = String(req.socket?.remoteAddress ?? 'local')
+        const burst = rateLimit.take(clientIp)
+        if (!burst.ok) {
+          stats.failed += 1
+          stats.rateLimited += 1
+          log?.({ scope: 'gateway', level: 'warn', message: `429 ${req.method} ${routePath}（速率超限 ip=${clientIp} 余 ${burst.retryAfterMs}ms 恢复）` })
+          return send(res, 429, {
+            error: { message: `rate limited — ${burst.retryAfterMs}ms 后恢复`, type: 'rate_limit_error' },
+          })
+        }
         const keyOk = authorized(req)
         if (!keyOk) {
           // 401 也留痕：调用方 Key 配错是最高频的接入问题
           // 不再把 Key 头前缀写进日志；也不再鼓励把 Key 放进 URL
-          log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配）` })
+          authFailures.record(clientIp)
+          const failCount = authFailures.count(clientIp)
+          if (failCount === 10 || failCount === 50) {
+            logger?.warn?.(`credit-hub: 鉴权连续失败 ${failCount} 次（ip=${clientIp}）——可能有 agent 在用错误 Key 重试或本机进程在枚举`)
+          }
+          log?.({ scope: 'gateway', level: 'warn', message: `401 ${req.method} ${routePath}（Key 不匹配，ip=${clientIp} 第 ${failCount} 次）` })
           return send(res, 401, { error: { message: 'invalid gateway key — 请把网关页显示的 Key 填入 Authorization: Bearer 或 x-api-key 请求头', type: 'auth_error' } })
         }
+        authFailures.clear(clientIp)
         // trace 头统一在此下发：所有路由（GET/POST）都可由响应头回查 trace-id
         const requestTraceId = traceOf(req)
         res.setHeader('x-credit-hub-trace', requestTraceId)

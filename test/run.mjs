@@ -2291,6 +2291,87 @@ await testAsync('upgrade is idempotent: second run makes zero changes and preser
   await rmDir(dir)
 })
 
+// ── 优先级六：速率限制 / 鉴权告警 / 响应增长上限 ───────────────────────────
+await testAsync('rate-limit: token bucket capacity, refill, and per-key isolation', () => {
+  return (async () => {
+    const { createTokenBucket, createFailureCounter } = await import('../src/rate-limit.js')
+    let t = 100_000
+    const bucket = createTokenBucket({ capacity: 3, msPerToken: 1000, now: () => t })  // 1 token / 1s
+    // 连续取 3 个 → 全部成功
+    assert.equal(bucket.take('a').ok, true)
+    assert.equal(bucket.take('a').ok, true)
+    assert.equal(bucket.take('a').ok, true)
+    // 第 4 个 → 429 + retryAfter
+    const denied = bucket.take('a')
+    assert.equal(denied.ok, false)
+    assert.ok(denied.retryAfterMs >= 250 && denied.retryAfterMs <= 1500, `retryAfter sane (${denied.retryAfterMs}ms)`)
+    // 时间推进 → 令牌回填
+    t += 1500  // 1.5 token
+    assert.equal(bucket.take('a').ok, true, 'refilled token admitted')
+    assert.equal(bucket.take('a').ok, false, 'still exhausted after one refill')
+    // key 隔离：b 不受 a 的影响
+    assert.equal(bucket.take('b').ok, true, 'per-key isolation')
+    // snapshot
+    const snap = bucket.snapshot()
+    assert.ok(snap.a && typeof snap.a.tokens === 'number')
+  })()
+})
+
+await testAsync('failure counter: records, clears on success, evicts oldest beyond cap', () => {
+  return (async () => {
+    const { createFailureCounter } = await import('../src/rate-limit.js')
+    const counter = createFailureCounter()
+    counter.record('ip1'); counter.record('ip1'); counter.record('ip1')
+    assert.equal(counter.count('ip1'), 3, 'accumulates')
+    counter.clear('ip1')
+    assert.equal(counter.count('ip1'), 0, 'clears on success')
+    // 防膨胀：256 个 key 上限，最旧被逐出
+    for (let i = 0; i < 300; i++) counter.record(`ip-${i}`)
+    assert.equal(counter.count('ip-0'), 0, 'oldest evicted beyond cap')
+    assert.equal(counter.count('ip-299'), 1, 'recent still tracked')
+  })()
+})
+
+await testAsync('gateway: 429 after rate limit burst; 401 counter logs repeated auth failures', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-rl-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 48000 + Math.floor(Math.random() * 2000) }))
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  try {
+    // 401 计数：连续错误 Key 打 12 次（>告警阈值 10）
+    const badAuth = { authorization: 'Bearer wrong-key-aaaaaaaaaaaaaaaa', 'content-type': 'application/json' }
+    const statuses = []
+    for (let i = 0; i < 12; i++) {
+      const r = await fetch(`http://${bind}/v1/models`, { headers: badAuth })
+      statuses.push(r.status)
+    }
+    assert.ok(statuses.every(s => s === 401), `wrong key → all 401 (got ${statuses.join(',')})`)
+    // 速率限制突发：本测试自身 + 上面 12 次 401 都计数。用快速连发把桶打空
+    // （容量 120/min，已经用 ~15，连发 150 次必触发 429）
+    let got429 = 0
+    for (let i = 0; i < 150; i++) {
+      const r = await fetch(`http://${bind}/v1/models`, { headers: badAuth })
+      if (r.status === 429) got429 += 1
+      if (got429 > 0) break
+    }
+    assert.ok(got429 > 0, 'burst triggers 429 rate limit')
+    const rateLimited = await fetch(`http://${bind}/v1/models`, { headers: badAuth })
+    assert.equal(rateLimited.status, 429)
+    const payload = await rateLimited.json()
+    assert.equal(payload.error.type, 'rate_limit_error')
+    assert.ok(payload.error.message.includes('ms'), '429 message carries recovery time')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
