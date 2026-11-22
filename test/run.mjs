@@ -1950,7 +1950,7 @@ await testAsync('diagnostics snapshot aggregates catalog/breakers/gateway/channe
     stores, hub, workbuddy: { status: () => ({ accounts: 1, ok: 1 }) },
     upstreams: { status: () => ({ upstreams: 0, models: 0 }) },
     gateway: { running: true, bind: () => '127.0.0.1:8330', stats: () => ({ requests: 3, ok: 3, failed: 0 }) },
-    version: '0.4.1', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    version: 'test-version', settingsKeys: [], logs: () => [], clearLogs: () => {},
     usage: () => [{ model: 'wb/m1', ok: 2, failed: 1, lastAt: 1 }],
     packStatus: () => ({ mounted: true, reason: 'forced' }),
     log: () => {}, warn: () => {},
@@ -1978,8 +1978,9 @@ await testAsync('diagnostics snapshot aggregates catalog/breakers/gateway/channe
     // 最近失败
     assert.equal(diag.recentFailures.length, 1, 'only models with failed>0')
     assert.equal(diag.recentFailures[0].model, 'wb/m1')
-    // 版本透传
-    assert.equal(diag.version, '0.4.1')
+    // 版本透传（mock 注入什么就透传什么——不再依赖真实 package.json，
+    // 这样发版改版本号不会让本测试红一次）
+    assert.equal(diag.version, 'test-version')
   } finally {
     await new Promise(resolve => server.close(resolve))
     stores.dispose()
