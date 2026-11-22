@@ -1986,6 +1986,169 @@ await testAsync('diagnostics snapshot aggregates catalog/breakers/gateway/channe
   }
 })
 
+// ── 优先级六 + 二补充：网关错误语义 / client-abort / 双栈 ──────────────────
+await testAsync('gateway: invalid JSON → 400 without stack; server errors leak no stack in body', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-json-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  try {
+    // 非法 JSON → 400（客户端错误），不再 500
+    const r1 = await fetch(`http://${bind}/v1/chat/completions`, { method: 'POST', headers: auth, body: '{invalid' })
+    assert.equal(r1.status, 400, `invalid JSON → 400 (got ${r1.status})`)
+    const p1 = await r1.json()
+    assert.equal(p1.error.type, 'invalid_request_error')
+    assert.ok(!p1.error.stack, 'no stack leaked on 400')
+    assert.ok(!/\bat\s+\S+\(.*:\d+:\d+\)/.test(p1.error.message), 'no stack frames (file:line:col) in message')
+    // 空数组 JSON（合法 JSON 但缺 model）→ 不是 500（解析层不炸）
+    const r2 = await fetch(`http://${bind}/v1/chat/completions`, { method: 'POST', headers: auth, body: '[]' })
+    assert.ok(r2.status < 500, `[] body → ${r2.status} (<500)`)
+    const p2 = await r2.json().catch(() => ({}))
+    assert.ok(!p2.error?.stack, 'no stack leaked on structured error')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('gateway: client disconnect aborts upstream request (single wire)', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-abort-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  let sawAbort = false
+  let upstreamStarted = false
+  let upstreamSettled = null
+  const workbuddy = {
+    listModels: async () => [{ id: 'wb/ab', source: 'workbuddy', name: 'AB', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: ({ signal }) => new Promise(resolve => {
+      upstreamStarted = true
+      signal?.addEventListener('abort', () => { sawAbort = true; upstreamSettled = 'aborted'; resolve({ sawText: true, sawFinish: true, finish: 'stop', usage: {}, nextIndex: 0 }) })
+    }),
+    status: () => ({ accounts: 1, ok: 1 }),
+  }
+  const hub = createHubRuntime({ stores, workbuddy, upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  try {
+    // 预热 catalog：冷启动时 prepareCall 要计算目录（数百 ms），若在 dispatch 前
+    // abort，上游根本收不到请求，abort 传播无从谈起（实测发现）。
+    await fetch(`http://${bind}/v1/chat/completions`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({ model: 'wb/ab', messages: [{ role: 'user', content: 'warm' }] }),
+    })
+    const controller = new AbortController()
+    // 流式请求发起后等上游进入 streamTurn，再断开客户端
+    const pending = fetch(`http://${bind}/v1/chat/completions`, {
+      method: 'POST', headers: auth, signal: controller.signal,
+      body: JSON.stringify({ model: 'wb/ab', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    }).catch(() => 'client aborted')
+    for (let i = 0; i < 50 && !upstreamStarted; i++) await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(upstreamStarted, true, 'upstream streamTurn entered before abort')
+    controller.abort()
+    const outcome = await Promise.race([
+      pending,
+      new Promise(resolve => setTimeout(() => resolve('upstream hung after client abort'), 3000)),
+    ])
+    assert.equal(outcome, 'client aborted', 'client fetch rejects on abort')
+    assert.equal(sawAbort, true, 'upstream streamTurn received abort signal')
+    assert.equal(upstreamSettled, 'aborted')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('gateway listens on both IPv4 and IPv6 loopback (dual-stack)', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-dual-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const port = bind.split(':')[1]
+  const auth = { authorization: `Bearer ${gateway.key()}` }
+  try {
+    const r4 = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: auth })
+    assert.equal(r4.status, 200, 'IPv4 loopback answers')
+    let v6Status = null
+    try { v6Status = (await fetch(`http://[::1]:${port}/v1/models`, { headers: auth })).status } catch { v6Status = 'unreachable' }
+    assert.equal(v6Status, 200, `IPv6 loopback answers (got ${v6Status})`)
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('finish semantics unified: max-tokens vs stop vs error across openai and claude wires', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-fin-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  let finishMode = 'stop'
+  const scripted = {
+    listModels: async () => [{ id: 'wb/f', source: 'workbuddy', name: 'F', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async ({ onChunk }) => {
+      onChunk({ type: 'block-start', index: 0, blockType: 'text' })
+      onChunk({ type: 'text-delta', index: 0, text: 'x' })
+      onChunk({ type: 'block-end', index: 0, block: { type: 'text', text: 'x' } })
+      return { sawText: true, sawFinish: true, finish: finishMode, usage: { inputTokens: 1, outputTokens: 1 }, nextIndex: 0 }
+    },
+    status: () => ({ accounts: 1, ok: 1 }),
+  }
+  const hub = createHubRuntime({ stores, workbuddy: scripted, upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  try {
+    // 正常 stop：两条线都是正常收尾
+    finishMode = 'stop'
+    const oaStop = await (await fetch(`http://${bind}/v1/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/f', messages: [{ role: 'user', content: 'x' }] }) })).json()
+    assert.equal(oaStop.choices[0].finish_reason, 'stop')
+    // max_tokens：OpenAI → length；Claude → stop_reason max_tokens
+    finishMode = 'max_tokens'
+    const oaMax = await (await fetch(`http://${bind}/v1/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/f', messages: [{ role: 'user', content: 'x' }] }) })).json()
+    assert.equal(oaMax.choices[0].finish_reason, 'length', 'openai: max_tokens → length')
+    const clMax = await (await fetch(`http://${bind}/v1/messages`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/f', max_tokens: 100, messages: [{ role: 'user', content: 'x' }] }) })).json()
+    assert.equal(clMax.stop_reason, 'max_tokens', 'claude: max_tokens → stop_reason max_tokens')
+    // 错误 finish：hub 语义里 error 走 failure 路径（streamTurn throw / finish 帧带 failure），
+    // 而不是 outcome.finish='error'（那会被规整成 stop）。验证两条线的错误收尾：
+    scripted.streamTurn = async ({ onChunk }) => {
+      onChunk({ type: 'block-start', index: 0, blockType: 'text' })
+      onChunk({ type: 'text-delta', index: 0, text: 'partial' })
+      throw new Error('mid-stream death')
+    }
+    const oaErr = await (await fetch(`http://${bind}/v1/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/f', messages: [{ role: 'user', content: 'x' }], stream: true }) })).text()
+    assert.ok(oaErr.includes('"error"'), 'openai error frame present')
+    assert.ok(oaErr.includes('"content":"partial"'), 'openai: partial content preserved before error')
+    assert.ok(oaErr.includes('[DONE]'), 'stream still terminated properly')
+    const clErr = await (await fetch(`http://${bind}/v1/messages`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/f', max_tokens: 100, stream: true, messages: [{ role: 'user', content: 'x' }] }) })).text()
+    assert.ok(clErr.includes('event: error'), 'claude: error event present')
+    assert.ok(!clErr.includes('message_stop'), 'claude: no clean message_stop after error')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。

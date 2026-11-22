@@ -456,6 +456,8 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
             at: Date.now(), model: candidate.id, ok: true, usage: outcome.usage,
             traceId, ttfbMs: candidateFirstByteMs, totalMs: now() - candidateStartedAt,
             switchedFrom: switches.length > 0 ? switches : undefined,
+            fallbackCount: switches.length,
+            breakerState: 'closed',
           })
           return
         }
@@ -467,6 +469,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         }
         // 非重试类失败（auth/配置错）不熔断——换跳也救不了凭据问题；
         // 熔断只记可重试类失败，429 的 Retry-After 覆盖冷却时长。
+        const breakerStateBefore = breaker.snapshot()[breakerKey]?.state ?? 'closed'
         if (failure?.retryable !== false) {
           breaker.recordFailure(breakerKey, failure?.message, {
             category: failure?.category,
@@ -479,6 +482,9 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         recordTurn?.({
           at: Date.now(), model: candidate.id, ok: false, skipped: true, error: failure?.message,
           traceId, ttfbMs: candidateFirstByteMs, totalMs: now() - candidateStartedAt,
+          fallbackCount: switches.length,
+          breakerState: breakerStateBefore,
+          errorCategory: failure?.category,
         })
       }
       const failureSummary = {
@@ -592,7 +598,7 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
             },
           },
         }
-        recordTurn?.({ at: startedAt, model: entry.id, ok: false, error: failure?.message, traceId, ttfbMs: firstByteMs, totalMs: now() - startedAt })
+        recordTurn?.({ at: startedAt, model: entry.id, ok: false, error: failure?.message, traceId, ttfbMs: firstByteMs, totalMs: now() - startedAt, errorCategory: failure?.category, breakerState: breaker.snapshot()[entry.id]?.state ?? 'closed' })
         return
       }
       yield { type: 'usage', ...(outcome.usage !== undefined ? { usage: outcome.usage } : { usage: { inputTokens: 0, outputTokens: 0 } }) }

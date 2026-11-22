@@ -187,7 +187,7 @@ export function apply(ctx, config = {}) {
     usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage() }, 5000)
     usageFlushTimer.unref?.()
   }
-  const recordTurn = ({ model, ok, skipped, usage, traceId, ttfbMs, totalMs, error }) => {
+  const recordTurn = ({ model, ok, skipped, usage, traceId, ttfbMs, totalMs, error, fallbackCount, breakerState, errorCategory }) => {
     const row = usageStats.get(model) ?? { ok: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, lastAt: 0 }
     if (ok === true) row.ok += 1
     else if (skipped === true) row.skipped += 1
@@ -210,7 +210,14 @@ export function apply(ctx, config = {}) {
     scheduleUsageFlush()
     const latency = Number.isFinite(ttfbMs) && ttfbMs > 0 ? ` ttfb=${Math.round(ttfbMs)}ms` : ''
     const trace = traceId ? ` [${traceId}]` : ''
-    log({ scope: 'turn', message: `${model}${trace}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}${latency}${error ? ` — ${String(error).slice(0, 120)}` : ''}` })
+    // 结构化排查字段（优先级三）：候选切换数/熔断态/错误分类随日志一行带出
+    const parts = [`${model}${trace}: ${ok === true ? 'ok' : skipped === true ? 'skipped' : 'failed'}`]
+    if (latency) parts.push(latency.trim())
+    if (Number.isFinite(fallbackCount) && fallbackCount > 0) parts.push(`fallback=${fallbackCount}`)
+    if (typeof breakerState === 'string' && breakerState !== 'closed') parts.push(`breaker=${breakerState}`)
+    if (typeof errorCategory === 'string') parts.push(`category=${errorCategory}`)
+    if (error) parts.push(`— ${String(error).slice(0, 120)}`)
+    log({ scope: 'turn', message: parts.join(' ') })
   }
   const hub = createHubRuntime({ stores, workbuddy, upstreams, packBridge, logger, warn, recordTurn, settings })
   const gateway = startGateway({ stores, hub, logger, settings, log })

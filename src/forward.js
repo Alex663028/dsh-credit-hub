@@ -576,6 +576,12 @@ export function startGateway({ stores, hub, logger, settings, log }) {
               : Array.isArray(parsed?.input) ? parsed.input.length : 0
           } catch {}
           log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} bytes=${bytes} messages=${messageCount}` })
+          // 客户端错误不该变成 500：非法 JSON 在各路由解析前统一拦截
+          // （优先级六：认证失败/解析失败不回传内部堆栈）
+          try { JSON.parse(rawBody || '{}') } catch (error) {
+            stats.failed += 1
+            return send(res, 400, { error: { message: `invalid JSON body: ${String(error.message).slice(0, 120)}`, type: 'invalid_request_error' } })
+          }
         }
         if (req.method === 'GET' && routePath === '/v1/models') {
           const rows = await hub.catalog()
@@ -646,11 +652,12 @@ export function startGateway({ stores, hub, logger, settings, log }) {
           : error?.code === CODE.notFound ? 404
           : error?.code === CODE.auth ? 502
           : 500
-        // 异常堆栈进日志页（前 6 行）——定位第三方 agent 的崩溃现场
+        // 异常堆栈只进日志（前 6 行）——定位第三方 agent 的崩溃现场；
+        // **响应体不回传堆栈**（优先级六：内部路径不该暴露给调用方）
         const stack = String(error?.stack ?? '').split('\n').slice(0, 6).join(' ⏎ ')
-        log?.({ scope: 'gateway', level: 'error', message: `${req.method} ${routePath} 500: ${error?.message ?? error} ｜ ${stack}` })
+        log?.({ scope: 'gateway', level: 'error', message: `${req.method} ${routePath} ${status}: ${error?.message ?? error} ｜ ${stack}` })
         logger?.warn?.(`credit-hub gateway: ${error?.message ?? error}`)
-        if (!res.writableEnded) send(res, status, { error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error', stack: String(error?.stack ?? '').split('\n').slice(0, 6) } })
+        if (!res.writableEnded) send(res, status, { error: { message: String(error?.message ?? 'gateway error'), type: 'gateway_error' } })
         stats.failed += 1
       }
     }
