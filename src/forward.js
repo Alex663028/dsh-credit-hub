@@ -16,6 +16,7 @@ import { mintKey, keyMatches } from './store.js'
 import { now, mintId } from './util.js'
 import { CODE } from './http.js'
 import { createTokenBucket, createFailureCounter } from './rate-limit.js'
+import { matchRoute, routeList } from './routes.js'
 import { openAiToHarness, openAiUsage, finishToOpenAi, openAiChunkFrames, partsText } from './transforms/openai.js'
 import { claudeToHarness, claudeUsage } from './transforms/claude.js'
 import { outcomeFinishToken, responsesInputToHarness, responsesToolsToHarness, responsesUsage } from './transforms/responses.js'
@@ -537,6 +538,40 @@ export function startGateway({ stores, hub, logger, settings, log }) {
     }
   }
 
+  // ── wire 路由处理器注册表（优先级一：路由表 + 处理器分离） ────────────────
+  // route.id → { build(body, traceId) → harnessOptions, stream, complete }
+  // 新增协议线：routes.js 加一行 + 此处加一项，分发逻辑无需改动。
+  const WIRE_HANDLERS = {
+    responses: {
+      build: (body, traceId) => {
+        const tools = responsesToolsToHarness(body.tools)
+        return {
+          model: String(body.model ?? ''),
+          messages: responsesInputToHarness(body),
+          maxTokens: clampMaxTokens(body.max_output_tokens ?? body.max_tokens ?? 8192),
+          ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
+          ...(Array.isArray(body.stop) ? { stop: body.stop } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+          ...(body.reasoning?.effort !== undefined ? { reasoningEffort: body.reasoning.effort } : {}),
+          sessionId: '',
+          traceId,
+        }
+      },
+      stream: streamResponses,
+      complete: completeResponses,
+    },
+    chat: {
+      build: (body, traceId) => ({ ...harnessOptions(body, openAiToHarness(body.messages), 'openai'), traceId }),
+      stream: streamOpenAi,
+      complete: completeOpenAi,
+    },
+    messages: {
+      build: (body, traceId) => ({ ...harnessOptions(body, claudeToHarness(body), 'claude'), traceId }),
+      stream: streamClaude,
+      complete: completeClaude,
+    },
+  }
+
   // ── server ────────────────────────────────────────────────────────────────
   async function doStart() {
     const port = currentPort()
@@ -600,8 +635,15 @@ export function startGateway({ stores, hub, logger, settings, log }) {
         // trace 头统一在此下发：所有路由（GET/POST）都可由响应头回查 trace-id
         const requestTraceId = traceOf(req)
         res.setHeader('x-credit-hub-trace', requestTraceId)
-        if (req.method === 'POST' && routePath.startsWith('/v1/')) {
-          // 请求体预览落日志：调用方接入排查的第一现场
+
+        // ── 路由表分发（优先级一）──────────────────────────────────────────
+        const route = matchRoute(req.method, routePath)
+        if (route === undefined) {
+          return send(res, 404, { error: { message: `no route ${req.method} ${routePath}`, type: 'not_found' } })
+        }
+
+        // wire 路由：先读体、记元数据、拦非法 JSON（客户端错误不该变 500）
+        if (route.id !== 'healthz' && route.id !== 'models') {
           rawBody = await readBody(req)
           // 只记元数据，绝不把请求体（system prompt / 对话内容）写进日志
           let modelPreview = ''
@@ -615,77 +657,42 @@ export function startGateway({ stores, hub, logger, settings, log }) {
               : Array.isArray(parsed?.input) ? parsed.input.length : 0
           } catch {}
           log?.({ scope: 'gateway', message: `${req.method} ${routePath} model=${modelPreview} bytes=${bytes} messages=${messageCount}` })
-          // 客户端错误不该变成 500：非法 JSON 在各路由解析前统一拦截
-          // （优先级六：认证失败/解析失败不回传内部堆栈）
           try { JSON.parse(rawBody || '{}') } catch (error) {
             stats.failed += 1
             return send(res, 400, { error: { message: `invalid JSON body: ${String(error.message).slice(0, 120)}`, type: 'invalid_request_error' } })
           }
         }
-        if (req.method === 'GET' && routePath === '/v1/models') {
+
+        if (route.id === 'healthz') return send(res, 200, { ok: true })
+
+        if (route.id === 'models') {
           const rows = await hub.catalog()
           return send(res, 200, {
             object: 'list',
             data: rows.filter(entry => entry.disabled !== true).map(entry => ({ id: entry.id, object: 'model', owned_by: 'credit-hub', created: 0 })),
           })
         }
-        if (req.method === 'POST' && (routePath === '/v1/responses' || routePath === '/responses')) {
-          const body = JSON.parse(rawBody || '{}')
-          const traceId = requestTraceId
-          const tools = responsesToolsToHarness(body.tools)
-          const options = {
-            model: String(body.model ?? ''),
-            messages: responsesInputToHarness(body),
-            maxTokens: clampMaxTokens(body.max_output_tokens ?? body.max_tokens ?? 8192),
-            ...(Number.isFinite(Number(body.temperature)) ? { temperature: Number(body.temperature) } : {}),
-            ...(Array.isArray(body.stop) ? { stop: body.stop } : {}),
-            ...(tools.length > 0 ? { tools } : {}),
-            ...(body.reasoning?.effort !== undefined ? { reasoningEffort: body.reasoning.effort } : {}),
-            sessionId: '',
-            traceId,
-          }
-          const signal = new AbortController()
-          res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
-          const result = body.stream === true
-            ? await streamResponses(res, options, options.model, signal.signal)
-            : await completeResponses(res, options, options.model, signal.signal)
-          stats[result.ok ? 'ok' : 'failed'] += 1
-          stats.lastAt = now()
-          return
+
+        // wire 路由共用同一套流程：解析体 → build options → AbortController
+        // → stream/complete → 结果日志 + 统计。三条线只有 build 与处理器不同。
+        const handler = WIRE_HANDLERS[route.id]
+        if (handler === undefined) {
+          return send(res, 500, { error: { message: `route ${route.id} 未注册处理器`, type: 'gateway_error' } })
         }
-        if (req.method === 'POST' && (routePath === '/v1/chat/completions' || routePath === '/chat/completions')) {
-          const body = JSON.parse(rawBody || '{}')
-          const traceId = requestTraceId
-          const options = { ...harnessOptions(body, openAiToHarness(body.messages), 'openai'), traceId }
-          const signal = new AbortController()
-          // Abort on the *response* closing early — req 'close' also fires once
-          // the body has been consumed, which would kill healthy turns.
-          res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
-          const result = body.stream === true
-            ? await streamOpenAi(res, options, options.model, signal.signal)
-            : await completeOpenAi(res, options, options.model, signal.signal)
-          const resultError = result.ok ? null : (result.error ?? { message: 'upstream failed without error details' })
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(resultError.message ?? JSON.stringify(resultError)).slice(0, 160)}`}` })
-          stats[result.ok ? 'ok' : 'failed'] += 1
-          stats.lastAt = now()
-          return
-        }
-        if (req.method === 'POST' && (routePath === '/v1/messages' || routePath === '/messages')) {
-          const body = JSON.parse(rawBody || '{}')
-          const traceId = requestTraceId
-          const options = { ...harnessOptions(body, claudeToHarness(body), 'claude'), traceId }
-          const signal = new AbortController()
-          res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
-          const result = body.stream === true
-            ? await streamClaude(res, options, options.model, signal.signal)
-            : await completeClaude(res, options, options.model, signal.signal)
-          const resultError = result.ok ? null : (result.error ?? { message: 'upstream failed without error details' })
-          log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(resultError.message ?? JSON.stringify(resultError)).slice(0, 160)}`}` })
-          stats[result.ok ? 'ok' : 'failed'] += 1
-          stats.lastAt = now()
-          return
-        }
-        return send(res, 404, { error: { message: `no route ${req.method} ${routePath}`, type: 'not_found' } })
+        const body = JSON.parse(rawBody || '{}')
+        const options = handler.build(body, requestTraceId)
+        const signal = new AbortController()
+        // 只监听 *响应* 提前关闭：req 'close' 在请求体读完后也会触发，
+        // 用它会把健康的回合一起掐掉。
+        res.on('close', () => { if (res.writableEnded !== true) signal.abort() })
+        const result = body.stream === true
+          ? await handler.stream(res, options, options.model, signal.signal)
+          : await handler.complete(res, options, options.model, signal.signal)
+        const resultError = result.ok ? null : (result.error ?? { message: 'upstream failed without error details' })
+        log?.({ scope: 'gateway', message: `${routePath} ${options.model} → ${result.ok ? 'ok' : `失败: ${String(resultError.message ?? JSON.stringify(resultError)).slice(0, 160)}`}` })
+        stats[result.ok ? 'ok' : 'failed'] += 1
+        stats.lastAt = now()
+        return
       } catch (error) {
         const status = error?.statusCode === 413 ? 413
           : error?.code === CODE.notFound ? 404

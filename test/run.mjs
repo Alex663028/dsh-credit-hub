@@ -2372,6 +2372,78 @@ await testAsync('gateway: 429 after rate limit burst; 401 counter logs repeated 
   }
 })
 
+// ── 优先级一：路由表（声明式分发） ─────────────────────────────────────────
+await testAsync('routes: table matches exact paths, method-sensitive, no prefix leakage', async () => {
+  const { matchRoute, routeList, SIMPLE_ROUTES, WIRE_ROUTES } = await import('../src/routes.js')
+  // 三条 wire 线全别名可命中
+  for (const [method, path, expected] of [
+    ['POST', '/v1/responses', 'responses'], ['POST', '/responses', 'responses'],
+    ['POST', '/v1/chat/completions', 'chat'], ['POST', '/chat/completions', 'chat'],
+    ['POST', '/v1/messages', 'messages'], ['POST', '/messages', 'messages'],
+    ['GET', '/v1/models', 'models'], ['GET', '/healthz', 'healthz'],
+  ]) {
+    assert.equal(matchRoute(method, path)?.id, expected, `${method} ${path} → ${expected}`)
+  }
+  // 方法敏感：GET 不能命中 POST 路由
+  assert.equal(matchRoute('GET', '/v1/chat/completions'), undefined, 'method-sensitive')
+  assert.equal(matchRoute('POST', '/v1/models'), undefined, 'POST /v1/models 未注册')
+  // 精确匹配：前缀不该误命中
+  assert.equal(matchRoute('GET', '/v1/models-x'), undefined, 'no prefix leakage')
+  assert.equal(matchRoute('POST', '/v1/messages/extra'), undefined, 'no suffix leakage')
+  // 未知路径
+  assert.equal(matchRoute('POST', '/v1/nope'), undefined)
+  // 表结构自洽：id 唯一、method 合法、paths 非空
+  const list = routeList()
+  const ids = list.map(r => r.id)
+  assert.equal(new Set(ids).size, ids.length, 'route ids unique')
+  for (const route of list) {
+    assert.ok(['GET', 'POST'].includes(route.method), `合法 method: ${route.method}`)
+    assert.ok(route.paths.length > 0, `${route.id} 至少一个路径`)
+    assert.ok(route.paths.every(p => p.startsWith('/')), `${route.id} 路径必须以 / 开头`)
+  }
+  assert.equal(SIMPLE_ROUTES.length + WIRE_ROUTES.length, list.length)
+})
+
+await testAsync('gateway: route table drives real dispatch (all aliases answer, 404 for unknown)', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const dir = tmpDir('ch-routes-')
+  const stores = createStores(dir)
+  stores.settings.update(s => ({ ...s, gatewayPort: 47000 + Math.floor(Math.random() * 1500) }))
+  const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  const auth = { authorization: `Bearer ${gateway.key()}`, 'content-type': 'application/json' }
+  try {
+    // healthz 无需鉴权
+    assert.equal((await fetch(`http://${bind}/healthz`)).status, 200, '/healthz without auth')
+    // 三个别名各打一次（保证路由表真的被分发逻辑使用）
+    const body = { model: 'wb/m1', messages: [{ role: 'user', content: 'x' }], max_tokens: 8 }
+    for (const path of ['/v1/chat/completions', '/chat/completions']) {
+      const r = await fetch(`http://${bind}${path}`, { method: 'POST', headers: auth, body: JSON.stringify(body) })
+      assert.equal(r.status, 200, `${path} answers via table`)
+    }
+    for (const path of ['/v1/messages', '/messages']) {
+      const r = await fetch(`http://${bind}${path}`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/m1', max_tokens: 8, messages: [{ role: 'user', content: 'x' }] }) })
+      assert.equal(r.status, 200, `${path} answers via table`)
+    }
+    for (const path of ['/v1/responses', '/responses']) {
+      const r = await fetch(`http://${bind}${path}`, { method: 'POST', headers: auth, body: JSON.stringify({ model: 'wb/m1', input: 'x', max_output_tokens: 8 }) })
+      assert.equal(r.status, 200, `${path} answers via table`)
+    }
+    // 未注册路径 → 404
+    const unknown = await fetch(`http://${bind}/v1/does-not-exist`, { method: 'POST', headers: auth, body: '{}' })
+    assert.equal(unknown.status, 404, 'unknown route → 404')
+    const unknownPayload = await unknown.json()
+    assert.match(unknownPayload.error.message, /no route/, '404 names the route miss')
+  } finally {
+    await gateway.stop()
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。

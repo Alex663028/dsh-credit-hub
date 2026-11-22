@@ -67,7 +67,8 @@ runCombo（降级链核心）
 | `client.js` | 浏览器半身（单文件 bundle，宿主只认单入口） | IIFE 幂等守卫 |
 | `src/hub.js` | 统一目录 / 降级链 / 熔断接入 / 失败帧 | 核心 |
 | `src/breaker.js` | 成员健康度：熔断/冷却/半开（内存态） | 批次五 |
-| `src/forward.js` | 8330 网关 + 三线协议转换 + trace-id | |
+| `src/forward.js` | 8330 网关 + 三线协议转换 + trace-id + 限流 | |
+| `src/routes.js` | 网关路由表（声明式）；新增协议线只需加一行 | 优先级一 |
 | `src/aggregate.js` | 自填上游 + 预设 + 千帆 token 续期 | |
 | `src/workbuddy.js` | WorkBuddy 渠道运行时（协议对齐 workbuddy2api） | |
 | `src/workbuddy-adapter.js` | WorkBuddy 独立 provider 车道 | |
@@ -77,6 +78,7 @@ runCombo（降级链核心）
 | `src/wire.js` | 宿主 chunk → 上游请求体 + WorkBuddy 出站修正 | |
 | `src/http.js` | postJson/getJson/postSse + UpstreamError（category/retryable） | 统一错误模型 |
 | `src/validate.js` | 管理面输入校验（400 + 逐字段原因） | |
+| `src/rate-limit.js` | 令牌桶限流 + 鉴权失败计数器 | 优先级六 |
 | `src/store.js` | JSON 持久化（原子写 + fsync + 迁移） | |
 | `src/api.js` | 管理面 REST 路由 | |
 | `src/util.js` | mintId / clamp / createRing | |
