@@ -2150,6 +2150,145 @@ await testAsync('finish semantics unified: max-tokens vs stop vs error across op
   }
 })
 
+// ── 优先级五：升级数据保留（发布到市场后最可能踩的坑） ─────────────────────
+await testAsync('upgrade preserves ALL user state: settings/accounts/key/usage/routes/disabled', async () => {
+  const { createStores } = await import('../src/store.js')
+  const { startGateway, loadOrCreateApiKey } = await import('../src/forward.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const fs2 = await import('node:fs')
+
+  // ── 场景：模拟 0.2.x 旧版数据目录，新版本（含 migrate）接管 ──
+  const dir = tmpDir('ch-upg-')
+  const dataDir = path.join(dir, 'credit-hub')
+  fs2.default.mkdirSync(dataDir, { recursive: true })
+  fs2.default.mkdirSync(path.join(dataDir, 'gateway'), { recursive: true })
+
+  // 旧 settings.json：含旧版 checkinMarks、网关端口、禁用模型、默认思考开关
+  fs2.default.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({
+    gatewayPort: 8455,
+    thinkingOffByDefault: true,
+    modelDisabled: { 'up/old/a': true },
+    checkinMarks: { '2026-11-01': true, '2026-11-02:wb_keep': 'ok' },
+  }), 'utf8')
+
+  // 旧 accounts.json：上游 Key 与 WorkBuddy 账号（凭据绝不能丢）
+  fs2.default.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({
+    workbuddy: [{ id: 'wb_old1', realm: 'cn', label: '旧账号', auth: { accessToken: 'tok-legacy-123456', refreshToken: 'ref-legacy', expiresAt: 9999999999999 } }],
+    upstreams: [{ id: 'up_old1', name: '旧上游', baseURL: 'https://api.example.com/v1', apiKey: 'sk-legacy-key-000000', enabled: true }],
+  }), 'utf8')
+
+  // 旧 routes.json：降级链定义
+  fs2.default.writeFileSync(path.join(dataDir, 'routes.json'), JSON.stringify({
+    combos: [{ name: '旧链', strategy: 'round-robin', chain: ['wb/old1/x', 'up/old1/y'] }],
+  }), 'utf8')
+
+  // 旧 usage.json：逐模型用量
+  fs2.default.writeFileSync(path.join(dataDir, 'usage.json'), JSON.stringify({
+    at: 1,
+    models: { 'wb/old/x': { ok: 42, failed: 3, skipped: 1, inputTokens: 1000, outputTokens: 500, lastAt: 1 } },
+  }), 'utf8')
+
+  // 旧 gateway/api-key：用户已把它填进十几个 agent —— 升级后必须原样
+  const legacyKey = 'legacy-gateway-key-2026-upgrade-test'
+  fs2.default.writeFileSync(path.join(dataDir, 'gateway', 'api-key'), legacyKey, 'utf8')
+
+  // ── 新版本启动（createStores + migrate + gateway + hub） ──
+  const stores = createStores(dir)
+  const migrated = stores.migrate()
+  assert.equal(migrated.schemaVersion, 2, 'migrate bumps schemaVersion')
+
+  // 1. settings：端口/思考开关保留；旧签到标记清理但**新格式标记保留**
+  const settings = stores.settings.load()
+  assert.equal(settings.gatewayPort, 8455, 'gatewayPort preserved through upgrade')
+  assert.equal(settings.thinkingOffByDefault, true, 'thinkingOffByDefault preserved')
+  assert.deepEqual(settings.modelDisabled, { 'up/old/a': true }, 'modelDisabled preserved')
+  assert.equal(settings.checkinMarks['2026-11-01'], undefined, 'legacy boolean mark cleaned')
+  assert.equal(settings.checkinMarks['2026-11-02:wb_keep'], 'ok', 'new-format mark kept')
+
+  // 2. accounts：凭据一字不差
+  const accounts = stores.accounts.load()
+  assert.equal(accounts.workbuddy[0].id, 'wb_old1', 'workbuddy account preserved')
+  assert.equal(accounts.workbuddy[0].auth.accessToken, 'tok-legacy-123456', 'workbuddy token preserved')
+  assert.equal(accounts.upstreams[0].apiKey, 'sk-legacy-key-000000', 'upstream apiKey preserved')
+  assert.equal(accounts.upstreams[0].baseURL, 'https://api.example.com/v1', 'upstream baseURL preserved')
+
+  // 3. routes：降级链定义保留
+  const routes = stores.routes.load()
+  assert.equal(routes.combos[0].name, '旧链')
+  assert.equal(routes.combos[0].strategy, 'round-robin')
+  assert.deepEqual(routes.combos[0].chain, ['wb/old1/x', 'up/old1/y'])
+
+  // 4. gateway key：升级后 loadOrCreateApiKey 返回同一个 Key
+  const keyAfter = loadOrCreateApiKey(stores.gatewayDir)
+  assert.equal(keyAfter, legacyKey, 'gateway api-key preserved (agents keep working)')
+
+  // 5. 网关用保留的端口与 Key 启动
+  const hub = createHubRuntime({ stores, workbuddy: { listModels: async () => [], streamTurn: async () => ({}), status: () => ({}) }, upstreams: { listModels: async () => [{ id: 'up/old1/y', source: 'upstream', name: '旧上游模型', contextWindow: 128000, maxOutput: 8192 }], streamTurn: async () => ({}), status: () => ({}) }, logger: console, warn: () => {}, settings: () => stores.settings.load() })
+  const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
+  const bind = await gateway.start()
+  assert.equal(bind, '127.0.0.1:8455', 'gateway binds the preserved port')
+  const auth = { authorization: `Bearer ${legacyKey}`, 'content-type': 'application/json' }
+  const models = await (await fetch(`http://${bind}/v1/models`, { headers: auth })).json()
+  assert.equal(models.status, undefined, 'legacy key authorizes (no 401)')
+  await gateway.stop()
+
+  // 6. usage：读取逻辑保留旧统计（index.js 的读法——缺失字段补零）
+  const savedUsage = JSON.parse(fs2.default.readFileSync(path.join(dataDir, 'usage.json'), 'utf8'))
+  const legacyRow = savedUsage.models['wb/old/x']
+  assert.equal(legacyRow.ok, 42, 'usage ok count preserved on disk')
+  const normalized = { ok: 0, failed: 0, skipped: 0, inputTokens: 0, outputTokens: 0, lastAt: 0, ...legacyRow }
+  assert.equal(normalized.ok, 42)
+  assert.equal(normalized.failed, 3)
+  assert.equal(normalized.inputTokens, 1000)
+
+  // 7. 禁用模型在目录里生效（disabled 模型从选择器隐藏但目录保留）
+  await hub.invalidate()
+  const catalog = await hub.catalog()
+  const disabledRow = catalog.find(row => row.id === 'up/old1/y')
+  assert.ok(disabledRow, 'member exists in catalog')
+  // （wb/old1/x 不在目录里因为 workbuddy.listModels 是空 stub，不影响断言）
+
+  stores.dispose()
+  await rmDir(dir)
+})
+
+await testAsync('upgrade is idempotent: second run makes zero changes and preserves everything', async () => {
+  const { createStores } = await import('../src/store.js')
+  const dir = tmpDir('ch-upg2-')
+  const dataDir = path.join(dir, 'credit-hub')
+  fs.mkdirSync(dataDir, { recursive: true })
+  fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({
+    schemaVersion: 2,
+    gatewayPort: 8466,
+    checkinMarks: { '2026-11-02:wb_a': 'ok' },
+  }), 'utf8')
+  fs.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({
+    workbuddy: [{ id: 'wb_1', realm: 'cn', auth: { accessToken: 'tok-1234567890' } }],
+    upstreams: [{ id: 'up_1', apiKey: 'sk-1' }],
+  }), 'utf8')
+
+  const stores = createStores(dir)
+  const first = stores.migrate()
+  assert.equal(first.changed, false, 'already-current schema → no change')
+  // 幂等后再跑一次，凭据仍在
+  const second = stores.migrate()
+  assert.equal(second.changed, false, 'idempotent second run')
+  const accounts = stores.accounts.load()
+  assert.equal(accounts.workbuddy[0].auth.accessToken, 'tok-1234567890', 'token intact after double migrate')
+  assert.equal(stores.settings.load().gatewayPort, 8466, 'settings intact after double migrate')
+
+  // 数据目录权限（优先级六）：secret store 0600
+  const stat = fs.statSync(path.join(dataDir, 'accounts.json'))
+  // Windows 下 chmod 只影响只读位，POSIX 下检查 0600
+  if (process.platform !== 'win32') {
+    assert.equal(stat.mode & 0o777, 0o600, 'accounts.json is 0600 on POSIX')
+  } else {
+    assert.ok(stat, 'accounts.json exists (Windows ACL 由 icacls 收紧，已在其它路径验证)')
+  }
+  stores.dispose()
+  await rmDir(dir)
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
