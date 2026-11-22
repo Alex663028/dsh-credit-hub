@@ -46,7 +46,7 @@ for (const entry of filesField) if (!exists(entry)) bad(`package.files 引用了
 
 // ── 4. 关键发布文件 ─────────────────────────────────────────────────────────
 const REQUIRED = [
-  'README.md', 'LICENSE', 'install.ps1', 'market-index.json', 'cordis.patch.yml',
+  'README.md', 'CHANGELOG.md', 'LICENSE', 'install.ps1', 'market-index.json', 'cordis.patch.yml',
   'index.js', 'client.js',
   'docs/ARCHITECTURE.md', 'docs/TROUBLESHOOTING.md', 'docs/PROTOCOL-MATRIX.md',
 ]

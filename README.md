@@ -51,6 +51,7 @@ DSH 设置 → 积分汇通
 ## 文档
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 架构图、请求流转、模块清单、关键设计决策
+- [CHANGELOG.md](CHANGELOG.md) — 逐版本变更记录与升级注意事项
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 按症状排查：模型消失/401/熔断/千帆 token/数据位置/与 ofm 共存
 - [docs/PROTOCOL-MATRIX.md](docs/PROTOCOL-MATRIX.md) — 三线协议兼容矩阵（以测试为准，非代码推断） — 按症状排查：模型消失/401/熔断/千帆 token/数据位置/与 ofm 共存
 - **本地网关**：OpenAI + Anthropic 双协议，模型 id 前缀 `wb/`、`up/`、`pk/`、`combo/`。
