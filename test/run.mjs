@@ -2277,11 +2277,13 @@ await testAsync('upgrade is idempotent: second run makes zero changes and preser
   assert.equal(accounts.workbuddy[0].auth.accessToken, 'tok-1234567890', 'token intact after double migrate')
   assert.equal(stores.settings.load().gatewayPort, 8466, 'settings intact after double migrate')
 
-  // 数据目录权限（优先级六）：secret store 0600
+  // 数据目录权限（优先级六）：secret store 落盘时收紧 0600。
+  // 先触发一次真实 save（chmodSync 在 save 里执行），再断言——
+  // 直接 writeFileSync 的 fixture 是 0644，那验证的是测试自己不是 store。
+  stores.accounts.update(data => ({ ...data, upgraded: true }))
   const stat = fs.statSync(path.join(dataDir, 'accounts.json'))
-  // Windows 下 chmod 只影响只读位，POSIX 下检查 0600
   if (process.platform !== 'win32') {
-    assert.equal(stat.mode & 0o777, 0o600, 'accounts.json is 0600 on POSIX')
+    assert.equal(stat.mode & 0o777, 0o600, 'accounts.json is 0600 on POSIX after store save')
   } else {
     assert.ok(stat, 'accounts.json exists (Windows ACL 由 icacls 收紧，已在其它路径验证)')
   }
