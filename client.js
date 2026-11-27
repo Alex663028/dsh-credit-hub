@@ -700,7 +700,7 @@
             h(Toggle, { label: t('ov.autoCheckin'), checked: settings.autoCheckin === true, onChange: value => onSettings({ autoCheckin: value }) }),
             h(Toggle, { label: t('ov.packGateway'), checked: settings.packGateway === true, onChange: value => onSettings({ packGateway: value }), title: t('ov.packGateway.hint') }),
             h(Btn, { small: true, busy: refreshing, onClick: refreshModels, title: t('ov.refreshModels.hint') },
-              refreshing ? t('ov.refreshModels.busy') : t('ov.refreshModels'))),
+              refreshing ? t('ov.refreshModels.busy') : t('ov.refresh'))),
           h('div', { className: 'ch-muted', style: { marginTop: '8px' } }, t('ov.layer.hint'))),
         h(Toast, { toast }))
     }
