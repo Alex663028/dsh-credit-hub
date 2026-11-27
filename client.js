@@ -82,6 +82,10 @@
     'ov.packGateway': '渠道包独立网关（8326）',
     'ov.packGateway.hint': '关闭后 8330 单网关转出全部模型；开启则渠道包另起 8326 网关（与本插件功能重叠）。重启 DSH 后生效。',
     'ov.refresh': '刷新',
+    'ov.refreshModels': '更新模型清单',
+    'ov.refreshModels.busy': '更新中…',
+    'ov.refreshModels.hint': '清缓存并重新拉取各渠道最新模型清单（上游新上架的模型点这里）',
+    'ov.refreshModels.done': '模型清单已更新：{before} → {after}（新增 {added}）',
     'ov.pick.hint': '这些模型出现在聊天框模型选择器的「积分汇通」分组里',
     'ov.chips.hint': '点击开关模型（关闭后从选择器与网关隐藏，降级链不受影响）',
     'ov.chips.enableAll': '全部启用',
@@ -240,6 +244,10 @@
     'ov.packGateway': 'Channel-pack gateway (8326)',
     'ov.packGateway.hint': 'Off = single 8330 gateway serves every model. On = the channel pack also starts its own 8326 gateway (overlapping). Applies after restart.',
     'ov.refresh': 'Refresh',
+    'ov.refreshModels': 'Update models',
+    'ov.refreshModels.busy': 'Updating…',
+    'ov.refreshModels.hint': 'Clear caches and re-fetch every channel model list (use this after new models ship)',
+    'ov.refreshModels.done': 'Model list updated: {before} → {after} (+{added})',
     'ov.pick.hint': 'These models appear in the chat picker under "Credit Hub"',
 
     'chan.wb.desc': 'Native channel · device-flow login · account pool · credits & check-in',
@@ -611,6 +619,22 @@
         void api('/summary').then(payload => { if (mySeq === seq.current) setSummary(payload) }).catch(() => {})
         void api('/gateway').then(payload => { if (mySeq === seq.current) setGateway(payload) }).catch(() => {})
       }, [])
+      // 强制刷新模型清单：清 WorkBuddy 缓存 + 逐上游重新 discover + 重算目录。
+      // 与「刷新」不同——那个只重读缓存，上架新模型后永远看不到。
+      const [refreshing, setRefreshing] = useState(false)
+      const refreshModels = async () => {
+        setRefreshing(true)
+        try {
+          const payload = await api('/refresh-models')
+          const detail = (payload.details?.upstreams ?? [])
+            .map(row => `${row.name}: ${row.error ? `✘ ${row.error}` : `+${row.models}`}`)
+            .join('；')
+          const text = fmt('ov.refreshModels.done', { before: payload.before, after: payload.after, added: payload.added })
+          if ((payload.details?.errors ?? []).length > 0) showToast(`${text} — ${payload.details.errors.join('；')}`, 'warn')
+          else showToast(detail ? `${text}（${detail}）` : text)
+          load()
+        } catch (error) { showToast(`${t('common.failed')}: ${error.message}`, 'warn') } finally { setRefreshing(false) }
+      }
       usePoll(load, 10_000)
 
       const bind = gateway?.bind ?? '127.0.0.1:8330'
@@ -675,7 +699,8 @@
             h(Toggle, { label: t('ov.gatewayToggle'), checked: settings.gatewayEnabled !== false, onChange: value => onSettings({ gatewayEnabled: value }) }),
             h(Toggle, { label: t('ov.autoCheckin'), checked: settings.autoCheckin === true, onChange: value => onSettings({ autoCheckin: value }) }),
             h(Toggle, { label: t('ov.packGateway'), checked: settings.packGateway === true, onChange: value => onSettings({ packGateway: value }), title: t('ov.packGateway.hint') }),
-            h(Btn, { small: true, onClick: load }, t('ov.refresh'))),
+            h(Btn, { small: true, busy: refreshing, onClick: refreshModels, title: t('ov.refreshModels.hint') },
+              refreshing ? t('ov.refreshModels.busy') : t('ov.refreshModels'))),
           h('div', { className: 'ch-muted', style: { marginTop: '8px' } }, t('ov.layer.hint'))),
         h(Toast, { toast }))
     }

@@ -756,6 +756,11 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
     fetchCredits,
     checkin,
     tick,
+    /** 清空模型清单缓存（含 11102 负缓存），让下一次 listModels 重新打上游。 */
+    clearModelCache() {
+      modelCache.clear()
+      modelBlockUntil.clear()
+    },
     async listModels() {
       const out = []
       for (const realm of ['cn', 'global']) {

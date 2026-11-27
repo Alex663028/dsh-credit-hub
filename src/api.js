@@ -163,6 +163,39 @@ export function createApiRoutes(deps) {
       if (method === 'GET' && routePath === '/models') {
         return send(200, { models: await hub.catalog() })
       }
+      // ── 强制刷新模型清单（上游新上架模型 / 渠道新增模型） ────────────────
+      // 旧版「刷新」只重读缓存，模型上架后永远看不到。这里做真正的刷新：
+      //   1. 清 WorkBuddy 模型缓存（含 11102 负缓存）
+      //   2. 对所有启用且有 Key 的上游重新 discover（拿最新 /models）
+      //   3. 强制重算目录（force=true，跳过 45s 缓存）
+      // 单条上游失败不中断，结果里逐条汇报。
+      if (method === 'POST' && routePath === '/refresh-models') {
+        const before = (await hub.catalog()).length
+        const details = { workbuddy: 'skipped', upstreams: [], errors: [] }
+        try {
+          if (typeof workbuddy.clearModelCache === 'function') workbuddy.clearModelCache()
+          details.workbuddy = 'cleared'
+        } catch (error) { details.errors.push(`workbuddy: ${String(error?.message ?? error).slice(0, 120)}`) }
+        for (const row of upstreams.list()) {
+          if (row.enabled === false || row.hasKey !== true) continue
+          try {
+            const found = await upstreams.discover(row.id)
+            details.upstreams.push({ id: row.id, name: row.name, models: found.length })
+          } catch (error) {
+            details.upstreams.push({ id: row.id, name: row.name, error: String(error?.message ?? error).slice(0, 160) })
+            details.errors.push(`${row.name ?? row.id}: ${String(error?.message ?? error).slice(0, 120)}`)
+          }
+        }
+        const rows = await hub.catalog(true)
+        hub.invalidate()
+        deps.broadcast?.()
+        return send(200, {
+          before,
+          after: rows.length,
+          added: Math.max(0, rows.length - before),
+          details,
+        })
+      }
       if (method === 'POST' && routePath === '/models/toggle') {
         const body = await readJson(req)
         assertValid(body, schemas.modelToggle)

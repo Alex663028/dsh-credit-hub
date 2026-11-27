@@ -2445,6 +2445,121 @@ await testAsync('gateway: route table drives real dispatch (all aliases answer, 
   }
 })
 
+// ── 模型清单强制刷新（上架新模型后可立即看到） ─────────────────────────────
+await testAsync('POST /refresh-models re-discovers upstreams and reports before/after', async () => {
+  const { default: http } = await import('node:http')
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { createUpstreamRuntime } = await import('../src/aggregate.js')
+  const { createApiRoutes } = await import('../src/api.js')
+  const dir = tmpDir('ch-refresh-')
+  const stores = createStores(dir)
+
+  // 上游运行时：discover 每次返回增加一个模型的「新上架」剧本
+  const upstreams = createUpstreamRuntime({ stores, log: () => {} })
+  let discoverCalls = 0
+  let wbCacheCleared = 0
+  const upstreamStub = {
+    list: () => [{ id: 'preset-deepseek', name: 'DeepSeek', enabled: true, hasKey: true }],
+    status: () => ({ upstreams: 1, models: 1 }),
+    discover: async () => { discoverCalls += 1; return [{ id: 'a' }, { id: `new-${discoverCalls}` }] },
+  }
+  const workbuddyStub = {
+    status: () => ({ accounts: 1, ok: 1 }),
+    listAccounts: () => [],
+    clearModelCache: () => { wbCacheCleared += 1 },
+    listModels: async () => [{ id: 'wb/cn/x', source: 'workbuddy', name: 'X', contextWindow: 128000, maxOutput: 8192 }],
+    streamTurn: async () => ({}),
+  }
+  const hub = createHubRuntime({
+    stores, workbuddy: workbuddyStub, upstreams: upstreamStub, logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  await hub.catalog(true)   // 预热
+
+  const api = createApiRoutes({
+    stores, hub, workbuddy: workbuddyStub, upstreams: upstreamStub,
+    gateway: { running: false, stats: () => ({}) },
+    version: 'test', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    log: () => {}, warn: () => {},
+  })
+  const server = http.createServer(api)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/credit-hub`
+    const result = await (await fetch(`${base}/refresh-models`, { method: 'POST' })).json()
+    // 真的调了上游 discover（而不是重读缓存）
+    assert.equal(discoverCalls, 1, 'upstream.discover invoked')
+    // 真的清了 WorkBuddy 缓存
+    assert.equal(wbCacheCleared, 1, 'workbuddy cache cleared')
+    // 汇报了前后数量
+    assert.equal(typeof result.before, 'number')
+    assert.equal(typeof result.after, 'number')
+    assert.ok(Array.isArray(result.details.upstreams), 'per-upstream detail array')
+    assert.equal(result.details.upstreams[0].id, 'preset-deepseek')
+    assert.equal(result.details.upstreams[0].models, 2, 'discover result count reported')
+    assert.equal(result.details.workbuddy, 'cleared')
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
+await testAsync('POST /refresh-models survives a failing upstream (per-item error, others continue)', async () => {
+  const { default: http } = await import('node:http')
+  const { createStores } = await import('../src/store.js')
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { createApiRoutes } = await import('../src/api.js')
+  const dir = tmpDir('ch-refresh2-')
+  const stores = createStores(dir)
+  const upstreamStub = {
+    list: () => [
+      { id: 'up-bad', name: '坏上游', enabled: true, hasKey: true },
+      { id: 'up-good', name: '好上游', enabled: true, hasKey: true },
+      { id: 'up-nokey', name: '无Key', enabled: true, hasKey: false },
+      { id: 'up-disabled', name: '已禁用', enabled: false, hasKey: true },
+    ],
+    status: () => ({ upstreams: 2, models: 0 }),
+    discover: async id => {
+      if (id === 'up-bad') throw new Error('401 invalid api key')
+      return [{ id: 'm1' }]
+    },
+  }
+  const workbuddyStub = { status: () => ({ accounts: 0, ok: 0 }), listAccounts: () => [], listModels: async () => [], streamTurn: async () => ({}) }
+  const hub = createHubRuntime({
+    stores, workbuddy: workbuddyStub, upstreams: upstreamStub, logger: console, warn: () => {},
+    settings: () => stores.settings.load(),
+  })
+  const api = createApiRoutes({
+    stores, hub, workbuddy: workbuddyStub, upstreams: upstreamStub,
+    gateway: { running: false, stats: () => ({}) },
+    version: 'test', settingsKeys: [], logs: () => [], clearLogs: () => {},
+    log: () => {}, warn: () => {},
+  })
+  const server = http.createServer(api)
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/credit-hub`
+    const result = await (await fetch(`${base}/refresh-models`, { method: 'POST' })).json()
+    // 只对「启用 + 有 Key」的上游发 discover
+    const touched = result.details.upstreams.map(row => row.id)
+    assert.deepEqual(touched.sort(), ['up-bad', 'up-good'], 'skips disabled and key-less upstreams')
+    // 失败的那个带 error，成功的照常汇报
+    const bad = result.details.upstreams.find(row => row.id === 'up-bad')
+    assert.match(bad.error, /401/, 'failing upstream error reported')
+    const good = result.details.upstreams.find(row => row.id === 'up-good')
+    assert.equal(good.models, 1, 'healthy upstream still discovered')
+    assert.ok(result.details.errors.length >= 1, 'errors aggregated for caller')
+    // 端点本身不 5xx
+    assert.equal(typeof result.after, 'number')
+  } finally {
+    await new Promise(resolve => server.close(resolve))
+    stores.dispose()
+    await rmDir(dir)
+  }
+})
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`)
 // 显式退出：undici 的 keep-alive 池与个别未 unref 的定时器在某些 CI 网络环境下
 // 会把事件循环钉住（2026-11-21 GitHub Actions 上 Host tests 挂 10 分钟被看门狗杀）。
