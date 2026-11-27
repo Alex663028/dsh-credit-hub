@@ -16,6 +16,9 @@
 - 修法：`broadcastCatalogChanged()` 补齐两级事件（`adapters-updated` +
   `models-updated('workbuddy'/'credit-hub')`）、llm 服务用 `ctx.root` 回退；两条车道注册完
   **立即同步广播**，并在启动后 3s / 15s 两次兜底；周期任务与 `/refresh-models` 统一走它。
+- 🔴 **CI 概率性失败（Node 22 windows 反复出现）**：各 e2e 用 `X + Math.random()*Y`
+  分配端口，区间大量重叠，两个测试撞同一端口且前一个 server 尚在 TIME_WAIT 时即
+  `EADDRINUSE`。改为进程内单调递增分配器 `nextTestPort()`，端口绝不重复。
 
 ---
 

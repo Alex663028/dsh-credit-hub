@@ -53,6 +53,13 @@ const testAsync = async (name, fn) => {
 }
 const tmpDir = prefix => fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 const rmDir = async dir => fs.promises.rm(dir, { recursive: true, force: true })
+// 测试端口分配器：进程内单调递增，保证每个 e2e 的端口绝不重复。
+// 旧版各处用 `X + Math.random() * Y`，区间大量重叠（46000–49000 用了 4 次…），
+// 两个测试撞到同一端口且前一个 server 尚在 TIME_WAIT 时 → EADDRINUSE 概率性
+// 失败（CI 上表现为单点 job 挂约 2 分钟、重跑即绿）。步进 7 让自身重试的
+// `+517` 顺移也落在已分配序列之外。
+let testPortCursor = 51000
+const nextTestPort = () => { testPortCursor += 7; return testPortCursor }
 
 // ── normalize ──────────────────────────────────────────────────────────────
 test('normalize openai-chat full turn', () => {
@@ -611,7 +618,7 @@ await testAsync('gateway e2e: openai/anthropic/combo/failover/usage-protocol/cus
   const dir = tmpDir('ch-e2e-')
   const stores = createStores(dir)
   // 随机高位端口：不与正式网关（默认 8330）冲突，npm test 可与本机共存
-  stores.settings.update(s => ({ ...s, gatewayPort: 20000 + Math.floor(Math.random() * 20000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const workbuddy = makeSource('wb')
   const upstreams = makeSource('up')
   const hub = createHubRuntime({ stores, workbuddy, upstreams, logger: console, warn: () => {} })
@@ -901,7 +908,7 @@ test('stores.migrate() upgrades schemaVersion and clears legacy checkin marks', 
 await testAsync('gateway start is single-flight; stop survives a live SSE and frees the port', async () => {
   const dir = tmpDir('ch-life-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 20000 + Math.floor(Math.random() * 20000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const workbuddy = makeSource('wb')
   const upstreams = makeSource('up')
   const hub = createHubRuntime({ stores, workbuddy, upstreams, logger: console, warn: () => {} })
@@ -1283,7 +1290,7 @@ await testAsync('gateway emits x-credit-hub-trace header and honors client x-req
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-trace-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 40000 + Math.floor(Math.random() * 10000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {} })
   const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
   const bind = await gateway.start()
@@ -1520,7 +1527,7 @@ await testAsync('protocol fixture: one gateway, three wires, scripted chunks →
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-proto-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 50000 + Math.floor(Math.random() * 9000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   // 剧本：reasoning → 文本 → 工具调用 → 结束（覆盖三个协议各自的映射难点）
   const upstreams = scriptedUpstream([
     { type: 'block-start', index: 0, blockType: 'reasoning' },
@@ -2046,7 +2053,7 @@ await testAsync('gateway: invalid JSON → 400 without stack; server errors leak
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-json-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
   const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
   const bind = await gateway.start()
@@ -2077,7 +2084,7 @@ await testAsync('gateway: client disconnect aborts upstream request (single wire
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-abort-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   let sawAbort = false
   let upstreamStarted = false
   let upstreamSettled = null
@@ -2129,7 +2136,7 @@ await testAsync('gateway listens on both IPv4 and IPv6 loopback (dual-stack)', a
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-dual-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
   const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
   const bind = await gateway.start()
@@ -2154,7 +2161,7 @@ await testAsync('finish semantics unified: max-tokens vs stop vs error across op
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-fin-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 46000 + Math.floor(Math.random() * 3000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   let finishMode = 'stop'
   const scripted = {
     listModels: async () => [{ id: 'wb/f', source: 'workbuddy', name: 'F', contextWindow: 128000, maxOutput: 8192 }],
@@ -2390,7 +2397,7 @@ await testAsync('gateway: 429 after rate limit burst; 401 counter logs repeated 
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-rl-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 48000 + Math.floor(Math.random() * 2000) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
   const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
   const bind = await gateway.start()
@@ -2462,7 +2469,7 @@ await testAsync('gateway: route table drives real dispatch (all aliases answer, 
   const { createHubRuntime } = await import('../src/hub.js')
   const dir = tmpDir('ch-routes-')
   const stores = createStores(dir)
-  stores.settings.update(s => ({ ...s, gatewayPort: 47000 + Math.floor(Math.random() * 1500) }))
+  stores.settings.update(s => ({ ...s, gatewayPort: nextTestPort() }))
   const hub = createHubRuntime({ stores, workbuddy: makeSource('wb'), upstreams: makeSource('up'), logger: console, warn: () => {}, settings: () => stores.settings.load() })
   const gateway = startGateway({ stores, hub, logger: console, settings: () => stores.settings.load() })
   const bind = await gateway.start()
