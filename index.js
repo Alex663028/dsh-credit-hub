@@ -144,9 +144,25 @@ export function apply(ctx, config = {}) {
   // 宿主把各 provider 的模型目录缓存在本地——不广播的话，WB 等汇通模型的
   // 开关在选择器里永远不生效（渠道包自己的 setDisabled 会广播，无需代劳）。
   // ⚠️ 必须在所有引用它的 runtime 创建之前定义（const 无提升）。
+  //
+  // 两级事件缺一不可（2026-11-27 修「WorkBuddy 一直显示加载失败」）：
+  //   - `llm/adapters-updated`：provider 拓扑变化，宿主重建路由表；
+  //   - `llm/models-updated(provider)`：宿主的模型选择器**明确监听它来重载
+  //     listModels()**。只发前者时，宿主若在插件启动早期（账号未就绪/网络抖动）
+  //     拉过一次失败的清单，就会把失败状态缓存住、之后永不重试。
+  // llm 服务用 ctx.root 回退查找（channel-pack 同款）：子 ctx 上不一定挂 llm。
   const broadcastCatalogChanged = () => {
-    try { ctx.llm?.emitAdaptersUpdated?.() } catch {}
-    try { ctx.emit?.('llm/adapters-updated') } catch {}
+    const resolveLlm = target => {
+      try { return target?.llm ?? null } catch { return null }
+    }
+    const llm = resolveLlm(ctx) ?? (ctx.root && ctx.root !== ctx ? resolveLlm(ctx.root) : null)
+    try { llm?.emitAdaptersUpdated?.() } catch {}
+    for (const event of ['llm/adapters-updated']) {
+      try { ctx.emit?.(event) } catch {}
+    }
+    for (const provider of ['workbuddy', 'credit-hub']) {
+      try { ctx.emit?.('llm/models-updated', provider) } catch {}
+    }
   }
 
   // 渠道包 8326 网关的进程级硬开关：必须在 pack 挂载前设置。pack 挂载是
@@ -253,6 +269,11 @@ export function apply(ctx, config = {}) {
   }
   ctx.effect(() => () => { wbRegistration?.() }, 'credit-hub: workbuddy adapter route')
 
+  // 两条车道都注册完，立即广播一次：宿主的模型目录缓存可能在注册瞬间就拉取，
+  // 早于账号数据就绪而缓存了失败结果。同步这一发 + 启动后 3s/15s 两次兜底，
+  // 三者共同保证「WorkBuddy 一直显示加载失败」不会粘住。
+  broadcastCatalogChanged()
+
   // ── 管理面 REST ────────────────────────────────────────────────────────────
   ctx.inject(['webServer'], scoped => {
     const api = createApiRoutes({
@@ -337,9 +358,8 @@ export function apply(ctx, config = {}) {
         stores.settings.update(current => ({ ...current, checkinMarks: marks }))
       }
       // 每 5 分钟广播一次模型目录变化，确保 DSH UI 能刷到新的 hub catalog
-      if (ctx.llm?.emitAdaptersUpdated) {
-        ctx.llm.emitAdaptersUpdated()
-      }
+      // （统一走 broadcastCatalogChanged：含 llm/models-updated，见上方说明）
+      broadcastCatalogChanged()
     } catch (error) {
       warn(`周期任务失败：${error?.message ?? error}`)
     }
@@ -349,12 +369,18 @@ export function apply(ctx, config = {}) {
   // 句柄必须保存并在 dispose 清理：旧版卸载后 20s 仍会跑一次 tick
   const startTimer = setTimeout(() => { void tick() }, 20_000)
   startTimer.unref?.()
+  // 启动后主动广播两次，纠正宿主在插件加载早期（账号尚未就绪 / 首次拉取失败）
+  // 缓存下来的失败模型清单——这正是「WorkBuddy 一直显示加载失败」的成因。
+  // 3s：账号数据通常已就绪；15s：渠道包异步挂载完成后的兜底。
+  const bootBroadcasts = [3_000, 15_000].map(delay => setTimeout(broadcastCatalogChanged, delay))
+  for (const handle of bootBroadcasts) handle.unref?.()
 
   // ── 清理 ──────────────────────────────────────────────────────────────────
   ctx.effect(() => () => {
     disposed = true
     clearInterval(timer)
     clearTimeout(startTimer)
+    for (const handle of bootBroadcasts) clearTimeout(handle)
     flushUsage()
     try { packDispose?.() } catch (error) { warn(`credit-hub: account pack 卸载失败：${error?.message ?? error}`) }
     packDispose = null

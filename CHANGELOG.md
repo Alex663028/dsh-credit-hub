@@ -5,6 +5,20 @@
 
 ---
 
+## [0.4.10] — 2026-11-27
+
+### 修复
+- 🔴 **「WorkBuddy 一直显示加载失败」**：宿主把各 provider 的模型目录缓存在本地，
+  并**明确监听 `llm/models-updated(provider)` 来重载 `listModels()`**（见宿主 Event 契约）。
+  本插件此前只发 `llm/adapters-updated`（拓扑变化），且 `ctx.llm?.emitAdaptersUpdated?.()`
+  未用 `ctx.root` 回退查找、在子 ctx 上是 no-op。结果：宿主若在插件启动早期（账号未就绪 /
+  网络抖动）拉过一次失败清单，就把失败状态永久缓存、之后永不重试。
+- 修法：`broadcastCatalogChanged()` 补齐两级事件（`adapters-updated` +
+  `models-updated('workbuddy'/'credit-hub')`）、llm 服务用 `ctx.root` 回退；两条车道注册完
+  **立即同步广播**，并在启动后 3s / 15s 两次兜底；周期任务与 `/refresh-models` 统一走它。
+
+---
+
 ## [0.4.9] — 2026-11-27
 
 ### 新增

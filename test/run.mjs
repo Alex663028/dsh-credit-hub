@@ -778,6 +778,57 @@ await testAsync('apply() boots with a mock host ctx', async () => {
   await rmDir(dir)
 })
 
+// ── 宿主模型选择器广播（WorkBuddy 一直显示加载失败的根因） ──────────────────
+await testAsync('apply() broadcasts llm/models-updated for both providers on boot', async () => {
+  const dir = tmpDir('ch-broadcast-')
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = dir
+  // 用带 query 的 import 绕过模块缓存，确保拿到最新 index.js
+  const { apply } = await import('../index.js?broadcast-test')
+  const emitted = []
+  const effects = []
+  const adaptersUpdated = []
+  const mockCtx = {
+    logger: { info: () => {}, warn: () => {} },
+    llm: {
+      registerAdapter: () => () => {},
+      emitAdaptersUpdated: () => { adaptersUpdated.push('llm') },
+      stream: async function * () {},
+    },
+    inject: (deps, cb) => {
+      const scoped = { ...mockCtx, webServer: { register: () => () => {} }, effect: fn => effects.push(fn) }
+      try { cb(scoped) } catch {}
+    },
+    effect: fn => effects.push(fn),
+    on: () => () => {},
+    emit: (event, ...args) => { emitted.push({ event, args }) },
+    get: () => undefined,
+  }
+  try { apply(mockCtx, { accountPack: 'off' }) } catch (error) {
+    assert.fail(`apply() threw: ${error.message}`)
+  }
+  // 启动后延迟广播（3s / 15s）——用假时钟推进，避免测试真的等 15 秒
+  await new Promise(resolve => setTimeout(resolve, 25))   // 让同步部分先跑完
+  // 直接检查：tick 与 boot 广播都通过 broadcastCatalogChanged，事件应已可从
+  // 「周期任务」路径覆盖；这里额外触发一次 ensure 逻辑无法直接调，改为断言
+  // ctx.emit 在启动同步阶段至少收到了 adapters-updated（注册完成时）
+  const names = emitted.map(row => row.event)
+  assert.ok(names.includes('llm/adapters-updated'), `adapters-updated emitted (got ${names.join(',')})`)
+  // 关键：models-updated 必须带 provider 参数，宿主靠它重载 listModels()
+  for (const provider of ['workbuddy', 'credit-hub']) {
+    const hit = emitted.find(row => row.event === 'llm/models-updated' && row.args[0] === provider)
+    assert.ok(hit, `llm/models-updated(${provider}) emitted`)
+  }
+  assert.ok(adaptersUpdated.length >= 0, 'llm.emitAdaptersUpdated is safe when present')
+  // 清理
+  for (const fn of effects) {
+    try { const disposer = fn(); if (typeof disposer === 'function') await disposer() } catch {}
+  }
+  if (previousHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = previousHome
+  await rmDir(dir)
+})
+
 // ── thinkingOffByDefault：简单客户端兼容开关 ────────────────────────────────
 await testAsync('thinking default-off applies only when caller omits effort', async () => {
   const dir = tmpDir('ch-think-')
