@@ -98,7 +98,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/Alex663028/dsh-credit-hub",
-            "commit": "7b8c76954d4d74756ceaa67eeb2c750b724a296c"
+            "commit": "6e3436da01aa3bc2aa4c25dc34ea0217207e79f4"
           },
           "engines": {
             "dsh": "^0.2.2-rc.3 || >=0.2.2"
