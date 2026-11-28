@@ -874,6 +874,34 @@ await testAsync('workbuddy adapter listModels never throws (host caches failures
   })
   const filtered = await mixed.listModels('workbuddy')
   assert.deepEqual(filtered.map(row => row.id), ['keep'], 'disabled filtered')
+  // 4. 国内版/国际版同名模型必须去重——宿主 llm.listModels 遇重复 id 抛
+  //    INVALID_CATALOG，会把整个 provider 记为「加载失败」且清空模型列表
+  const dual = createWorkbuddyAdapter({
+    workbuddy: { listModels: async () => [
+      { id: 'wb/cn/wb-lite', realm: 'cn', modelId: 'wb-lite', name: 'CN lite' },
+      { id: 'wb/global/wb-lite', realm: 'global', modelId: 'wb-lite', name: 'Global lite' },
+      { id: 'wb/cn/shared', realm: 'cn', modelId: 'shared', name: 'CN shared' },
+      { id: 'wb/global/shared', realm: 'global', modelId: 'shared', name: 'Global shared' },
+      { id: 'wb/global/only-global', realm: 'global', modelId: 'only-global', name: 'Global only' },
+    ] },
+    hub: hubStub,
+    settings: () => ({}),
+    warn: () => {},
+  })
+  const deduped = await dual.listModels('workbuddy')
+  const dedupedIds = deduped.map(row => row.id)
+  assert.equal(new Set(dedupedIds).size, dedupedIds.length, 'ids unique (host rejects duplicates)')
+  assert.deepEqual(dedupedIds, ['wb-lite', 'shared', 'only-global'], 'cn wins on name clash, global-only kept')
+  assert.equal(deduped[0].name, 'CN lite', 'cn metadata preferred')
+  // 5. 名称为空时用 id 兜底（宿主校验 name 非空）
+  const nameless = createWorkbuddyAdapter({
+    workbuddy: { listModels: async () => [{ id: 'wb/cn/x', realm: 'cn', modelId: 'x', name: '' }] },
+    hub: hubStub,
+    settings: () => ({}),
+    warn: () => {},
+  })
+  const withFallback = await nameless.listModels('workbuddy')
+  assert.equal(withFallback[0].name, 'x', 'empty name falls back to id')
 })
 
 await testAsync('hub aggregate adapter listModels survives catalog throw', async () => {

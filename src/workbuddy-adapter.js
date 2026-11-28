@@ -39,6 +39,12 @@ export function createWorkbuddyAdapter({ workbuddy, hub, settings, warn } = {}) 
      * 出错时返回空清单（宿主显示空分组，事件触发后自动恢复），而不是把一次
      * 网络抖动永久钉在 UI 上。同时加 12s 超时竞速——即使 runtime 内部卡住，
      * 也不许拖死宿主目录 RPC。
+     *
+     * ⚠️ id 必须唯一：宿主 `llm.listModels()` 会校验
+     * `seen.has(model.id)` → 抛 INVALID_CATALOG，把整个 provider 记为失败。
+     * 国内版与国际版存在同名模型（wb-lite / deepseek-v4.1-flash / glm-5.3），
+     * 裸 modelId 会撞车，所以按「国内优先」去重：两区同名时保留首个出现的
+     * （runtime 先遍历 cn 再 global），国际版独有模型照常保留。
      */
     async listModels(provider) {
       try {
@@ -46,15 +52,23 @@ export function createWorkbuddyAdapter({ workbuddy, hub, settings, warn } = {}) 
           workbuddy.listModels(),
           new Promise((_, reject) => setTimeout(() => reject(new Error('workbuddy 目录响应超时')), 12_000)),
         ])
-        return rows
-          .filter(row => disabledMap()[`wb/${row.realm}/${row.modelId}`] !== true)
-          .map(row => ({
+        const disabled = disabledMap()
+        const seen = new Set()
+        const out = []
+        for (const row of rows) {
+          if (seen.has(row.modelId)) continue
+          if (disabled[`wb/${row.realm}/${row.modelId}`] === true) continue
+          seen.add(row.modelId)
+          out.push({
             provider,
             id: row.modelId,
-            name: row.name,
-            description: row.description,
+            // name 为空同样会被宿主判为非法元数据（INVALID_CATALOG）→ 用 id 兜底
+            name: typeof row.name === 'string' && row.name.length > 0 ? row.name : row.modelId,
+            ...(typeof row.description === 'string' && row.description.length > 0 ? { description: row.description } : {}),
             inputModalities: row.vision === true ? ['text', 'image'] : ['text'],
-          }))
+          })
+        }
+        return out
       } catch (error) {
         warn?.(`credit-hub: workbuddy 适配器目录读取失败（宿主将显示空分组）：${String(error?.message ?? error).slice(0, 120)}`)
         return []

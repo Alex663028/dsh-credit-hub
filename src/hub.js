@@ -296,8 +296,9 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
         .map(entry => ({
           provider,
           id: entry.id,
-          name: entry.name,
-          description: entry.description,
+          // 宿主校验 name 非空 → 用 id 兜底（否则整个分组记 INVALID_CATALOG）
+          name: typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : entry.id,
+          ...(typeof entry.description === 'string' && entry.description.length > 0 ? { description: entry.description } : {}),
           inputModalities: entry.vision === true ? ['text', 'image'] : ['text'],
         }))
     },

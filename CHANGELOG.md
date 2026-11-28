@@ -5,6 +5,29 @@
 
 ---
 
+## [0.4.12] — 2026-11-28
+
+### 修复
+- 🔴 **「WorkBuddy 加载失败 + 没有模型列表」真正根因**：宿主 `dsh-llm` 的
+  `llm.listModels()` 会校验每个模型的 id 唯一性，**一旦发现重复就抛
+  `LlmError('INVALID_CATALOG')`**（`dsh-llm/src/index.ts:746`）。而 WorkBuddy 国内版与
+  国际版存在同名模型（`wb-lite` / `deepseek-v4.1-flash` / `glm-5.3`），适配器用裸
+  `modelId` 作 id 必然撞车 → 宿主把整个 `workbuddy` provider 记为 failure，并被
+  `buildModelCatalog` 的 `.filter(group => group.models.length > 0)` 丢弃 → 界面上
+  既是「加载失败」又完全没有模型列表。
+  - 修法：适配器按「国内优先」去重（两区同名保留首个，国际版独有模型照常保留）。
+  - 同时兜住 `name` 为空的情况（宿主同样校验 `name.length > 0`，空名用 id 兜底）；
+    `description` 为空串也不再下发。
+  - `credit-hub` 聚合适配器同步加上 `name` 兜底（其 id 为完整目录 id，天然唯一）。
+
+### 排查记录（供后来者）
+- 宿主机制：`buildModelCatalog()` 逐 provider 调 `llm.listModels()` **再对每个模型**
+  调 `resolveModelInfo()`；任一抛错即整组变 failure。
+- 此前的 0.4.10 / 0.4.11（事件广播 + adapter 永不抛错）是必要的防御，但**不是**这个
+  症状的根因——真正的拦路虎是 id 重复。三者现在并存，任一层都能拦住同类问题。
+
+---
+
 ## [0.4.11] — 2026-11-28
 
 ### 修复
