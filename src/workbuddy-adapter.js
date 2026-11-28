@@ -17,7 +17,7 @@
 import { UpstreamError, CODE } from './http.js'
 import { sanitizeEfforts, finiteOr } from './util.js'
 
-export function createWorkbuddyAdapter({ workbuddy, hub, settings }) {
+export function createWorkbuddyAdapter({ workbuddy, hub, settings, warn } = {}) {
   const disabledMap = () => settings()?.modelDisabled ?? {}
 
   return {
@@ -33,18 +33,32 @@ export function createWorkbuddyAdapter({ workbuddy, hub, settings }) {
       return hub.adapter.imageRequestPricing()
     },
 
+    /**
+     * 宿主模型选择器对抛错的 provider 记「{name} 加载失败：{message}」并缓存，
+     * 之后只在 adapters-updated 事件或手动重试时重拉。因此本方法**永不抛错**：
+     * 出错时返回空清单（宿主显示空分组，事件触发后自动恢复），而不是把一次
+     * 网络抖动永久钉在 UI 上。同时加 12s 超时竞速——即使 runtime 内部卡住，
+     * 也不许拖死宿主目录 RPC。
+     */
     async listModels(provider) {
-      const disabled = disabledMap()
-      const rows = await workbuddy.listModels()
-      return rows
-        .filter(row => disabled[`wb/${row.realm}/${row.modelId}`] !== true)
-        .map(row => ({
-          provider,
-          id: row.modelId,
-          name: row.name,
-          description: row.description,
-          inputModalities: row.vision === true ? ['text', 'image'] : ['text'],
-        }))
+      try {
+        const rows = await Promise.race([
+          workbuddy.listModels(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('workbuddy 目录响应超时')), 12_000)),
+        ])
+        return rows
+          .filter(row => disabledMap()[`wb/${row.realm}/${row.modelId}`] !== true)
+          .map(row => ({
+            provider,
+            id: row.modelId,
+            name: row.name,
+            description: row.description,
+            inputModalities: row.vision === true ? ['text', 'image'] : ['text'],
+          }))
+      } catch (error) {
+        warn?.(`credit-hub: workbuddy 适配器目录读取失败（宿主将显示空分组）：${String(error?.message ?? error).slice(0, 120)}`)
+        return []
+      }
     },
 
     async resolveModel(provider, model) {

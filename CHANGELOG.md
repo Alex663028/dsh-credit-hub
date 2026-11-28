@@ -5,6 +5,30 @@
 
 ---
 
+## [0.4.11] — 2026-11-28
+
+### 修复
+- 🔴 **「WorkBuddy 一直显示加载失败」根治**：宿主（聊天模型选择器）对抛错的 provider
+  显示「{name} 加载失败：{message}」并**缓存该失败**，只在 `llm/adapters-updated` /
+  `llm/models-updated` 事件或手动「重试」时重拉。插件侧三处加固，让宿主**永远不可能**
+  为 WorkBuddy 记失败：
+  - `workbuddy` 适配器 `listModels()` 加 try/catch + 12s 超时竞速——出错返回空清单
+    （宿主显示空分组，事件触发后自动恢复），不向宿主抛错；
+  - `credit-hub` 聚合适配器 `listModels()` 同样兜底（catalog 内部已按来源降级，
+    外层再兜 combos/settings 意外异常）；
+  - WorkBuddy `v3/config` 目录拉取超时 30s → **8s 快速失败**回退静态清单——此前
+    网络抖动时两个 realm 串行 30s×2 会把宿主目录 RPC 拖到 60s 触发超时失败。
+
+### 排查结论（供后来者）
+- 宿主文案定位：`dsh-client-ui-model-selection/src/client/locales.ts` 的
+  `'warning.groupLoad': '{name} 加载失败：{message}'`；客户端在
+  `service.ts` 监听 `llm/adapters-updated` + `llm/models-updated` 触发
+  `catalog.refresh()`。
+- 网关直调 `wb/cn/auto` 与 `workbuddy.listModels()` 实测均正常（27 模型 / 359ms），
+  失败是**宿主早前的缓存**——所以除事件广播外，更要让 adapter 永不抛错。
+
+---
+
 ## [0.4.10] — 2026-11-27
 
 ### 修复

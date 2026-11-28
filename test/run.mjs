@@ -836,6 +836,66 @@ await testAsync('apply() broadcasts llm/models-updated for both providers on boo
   await rmDir(dir)
 })
 
+// ── 宿主目录永不记「加载失败」：adapter listModels 永不抛错 ─────────────────
+await testAsync('workbuddy adapter listModels never throws (host caches failures otherwise)', async () => {
+  const { createWorkbuddyAdapter } = await import('../src/workbuddy-adapter.js')
+  const hubStub = { adapter: { providerRetryPolicy: () => ({}), imageRequestPricing: () => undefined } }
+  const warnings = []
+  // 1. runtime 抛错 → adapter 返回 []，不传播
+  const adapter = createWorkbuddyAdapter({
+    workbuddy: { listModels: async () => { throw new Error('network down') } },
+    hub: hubStub,
+    settings: () => ({}),
+    warn: message => warnings.push(String(message)),
+  })
+  const rows = await adapter.listModels('workbuddy')
+  assert.deepEqual(rows, [], 'throwing runtime → empty list, no propagation')
+  assert.equal(warnings.length, 1, 'failure logged once')
+  // 2. 正常路径仍返回映射后的模型
+  const ok = createWorkbuddyAdapter({
+    workbuddy: { listModels: async () => [{ id: 'wb/cn/x', realm: 'cn', modelId: 'x', name: 'X', vision: true }] },
+    hub: hubStub,
+    settings: () => ({ modelDisabled: { 'wb/cn/gone': true } }),
+    warn: () => {},
+  })
+  const mapped = await ok.listModels('workbuddy')
+  assert.equal(mapped.length, 1)
+  assert.equal(mapped[0].id, 'x')
+  assert.deepEqual(mapped[0].inputModalities, ['text', 'image'])
+  // 3. disabled 模型被过滤
+  const mixed = createWorkbuddyAdapter({
+    workbuddy: { listModels: async () => [
+      { id: 'wb/cn/keep', realm: 'cn', modelId: 'keep', name: 'K' },
+      { id: 'wb/cn/gone', realm: 'cn', modelId: 'gone', name: 'G' },
+    ] },
+    hub: hubStub,
+    settings: () => ({ modelDisabled: { 'wb/cn/gone': true } }),
+    warn: () => {},
+  })
+  const filtered = await mixed.listModels('workbuddy')
+  assert.deepEqual(filtered.map(row => row.id), ['keep'], 'disabled filtered')
+})
+
+await testAsync('hub aggregate adapter listModels survives catalog throw', async () => {
+  const { createHubRuntime } = await import('../src/hub.js')
+  const { createStores } = await import('../src/store.js')
+  const dir = tmpDir('ch-agg-never-')
+  const stores = createStores(dir)
+  const warnings = []
+  const hub = createHubRuntime({
+    stores,
+    workbuddy: { listModels: async () => { throw new Error('wb boom') } },
+    upstreams: { listModels: async () => { throw new Error('up boom') } },
+    logger: console, warn: m => warnings.push(String(m)),
+    settings: () => stores.settings.load(),
+  })
+  const adapter = hub.adapter
+  const rows = await adapter.listModels('credit-hub')
+  assert.ok(Array.isArray(rows), 'aggregate adapter always returns an array')
+  stores.dispose()
+  await rmDir(dir)
+})
+
 // ── thinkingOffByDefault：简单客户端兼容开关 ────────────────────────────────
 await testAsync('thinking default-off applies only when caller omits effort', async () => {
   const dir = tmpDir('ch-think-')

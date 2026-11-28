@@ -433,7 +433,10 @@ export function createWorkbuddyRuntime({ stores, log, warn, onAccountsChanged })
     }
     let entries = null
     try {
-      const body = await getJson(`${base}/v3/config`, { headers })
+      // 8s 快速失败：目录拉取是宿主模型选择器的一次 RPC，30s 超时 × 2 realm
+      // 会把宿主目录调用拖到 60s（网络抖动时触发「WorkBuddy 加载失败」）。
+      // 快速失败回退静态清单，宿主目录保持秒级返回。
+      const body = await getJson(`${base}/v3/config`, { headers, timeoutMs: 8_000 })
       const rows = findModelRows(body)
       if (rows.length > 0) entries = rows.map(toEntry).filter(Boolean)
     } catch (error) {

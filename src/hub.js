@@ -271,8 +271,19 @@ export function createHubRuntime({ stores, workbuddy, upstreams, packBridge, pac
       return FALLBACK_IMAGE_PRICING
     },
 
+    /**
+     * 永不抛错（与 workbuddy 适配器同理）：宿主把抛错记成「credit-hub 加载失败」
+     * 并缓存。catalog() 内部已按来源降级，这里再兜一层 combos()/settings() 的
+     * 意外异常，保证宿主目录 RPC 永远拿到一个数组。
+     */
     async listModels(provider) {
-      const rows = await catalog()
+      let rows
+      try {
+        rows = await catalog()
+      } catch (error) {
+        warn?.((`credit-hub: 聚合目录读取失败（宿主将显示空分组）：${String(error?.message ?? error).slice(0, 120)}`))
+        rows = []
+      }
       // 聚合路由只保留"没有独立 provider 可达"的模型，避免与各渠道分组重复：
       // - workbuddy：已注册独立车道，选择器里有「WorkBuddy」分组
       // - pack：模型来自渠道包/宿主各自注册的 provider（qoder/zcode/…），

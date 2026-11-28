@@ -262,7 +262,7 @@ export function apply(ctx, config = {}) {
   // hub.catalog；packBridge 排除表已加 'workbuddy'，不会桥接成 pk/workbuddy/*。
   let wbRegistration
   try {
-    wbRegistration = ctx.llm.registerAdapter(['workbuddy'], createWorkbuddyAdapter({ workbuddy, hub, settings }))
+    wbRegistration = ctx.llm.registerAdapter(['workbuddy'], createWorkbuddyAdapter({ workbuddy, hub, settings, warn }))
     logger.info?.('credit-hub: WorkBuddy 独立车道已注册（workbuddy）')
   } catch (error) {
     warn(`credit-hub: workbuddy 车道注册失败：${error?.message ?? error}`)
